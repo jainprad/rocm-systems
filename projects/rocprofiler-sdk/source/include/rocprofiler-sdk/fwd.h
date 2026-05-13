@@ -429,7 +429,8 @@ typedef enum rocprofiler_intercept_table_t
     ROCPROFILER_RCCL_TABLE           = (1 << 6),
     ROCPROFILER_ROCDECODE_TABLE      = (1 << 7),
     ROCPROFILER_ROCJPEG_TABLE        = (1 << 8),
-    ROCPROFILER_TABLE_LAST           = ROCPROFILER_ROCJPEG_TABLE,
+    ROCPROFILER_ROCSHMEM_TABLE       = (1 << 9),
+    ROCPROFILER_TABLE_LAST           = ROCPROFILER_ROCSHMEM_TABLE,
 } rocprofiler_intercept_table_t;
 
 /**

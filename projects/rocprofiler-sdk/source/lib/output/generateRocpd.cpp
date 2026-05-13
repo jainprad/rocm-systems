@@ -2041,6 +2041,7 @@ write_rocpd(
         insert_api_data(rccl_api_gen);
         insert_api_data(ompt_gen);
         insert_api_data(rocdecode_api_gen);
+        insert_api_data(rocshmem_api_gen);
     }
 
     insert_kernel_dispatch_data(dispatch_to_evt_id);

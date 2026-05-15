@@ -29,6 +29,15 @@ if(MPI_CXX_FOUND AND rocprofiler-register_FOUND)
     find_package(rocshmem CONFIG PATHS ${ROCM_PATH} /opt/rocm)
 endif()
 
+# rocSHMEM's installed config references both MPI::MPI_CXX and
+# rocprofiler-register::rocprofiler-register in the roc::rocshmem link interface, so both
+# must be located first or the find_package call will fail to define the imported target.
+find_package(MPI COMPONENTS CXX)
+find_package(rocprofiler-register CONFIG PATHS ${ROCM_PATH} /opt/rocm)
+if(MPI_CXX_FOUND AND rocprofiler-register_FOUND)
+    find_package(rocshmem CONFIG PATHS ${ROCM_PATH} /opt/rocm)
+endif()
+
 # applications used by integration tests which DO link to rocprofiler-sdk-roctx
 add_subdirectory(reproducible-runtime)
 add_subdirectory(reproducible-dispatch-count)

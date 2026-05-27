@@ -10,6 +10,7 @@
 #include "rocdefs.hpp"
 #include "rocdevice.hpp"
 #include "utils/flags.hpp"
+#include "utils/nontemporal.hpp"
 #include "utils/util.hpp"
 #include "rocprintf.hpp"
 #include "rocsched.hpp"
@@ -352,9 +353,16 @@ class VirtualGPU : public device::VirtualDevice {
         pending_preload_offset_ = preload_offset;
       }
 
-      //! Set metadata prefetching packet associated with regular aql packet
+      //! Write the metadata prefetch packet for the AQL slot at |index|.
+      //! |use_movdir64b|: use atomic 64B writes (no sfence between body/header).
+      //! |device_mem_ring_buf|: ring buffer is WC over PCIe — when MOVDIR64B is
+      //!   unavailable, stages locally then NT-copies to avoid scattered WC stores.
+      //! pending_descriptor_ is kernel-dispatch-only — barrier packets
+      //! never set it, so only the barrier branch runs for them.
       template <class AqlPacket>
-      inline void Set(AqlPacket* packet, uint16_t header, uint64_t index) {
+      inline void SetMetadata(AqlPacket* packet, uint16_t header,
+                              uint64_t index, bool use_movdir64b,
+                              bool device_mem_ring_buf) {
         if (!IsAttached()) {
           return;
         }
@@ -362,17 +370,71 @@ class VirtualGPU : public device::VirtualDevice {
           if (pending_descriptor_ == nullptr) {
             return;
           }
-          hsa_amd_metadata_kernel_dispatch_packet_t* queue_metadata_packet =
+          auto* queue_metadata_packet =
                &(reinterpret_cast<hsa_amd_metadata_kernel_dispatch_packet_t*>(
                    queue_base_))[index];
-          SetPacket(packet, header, queue_metadata_packet);
+          SetPacket(packet, header, queue_metadata_packet,
+                    use_movdir64b, device_mem_ring_buf);
         } else if constexpr (std::is_same_v<AqlPacket, hsa_barrier_and_packet_t> ||
                              std::is_same_v<AqlPacket, hsa_amd_barrier_value_packet_t>) {
-          hsa_amd_metadata_barrier_packet_t* queue_metadata_packet =
+          auto* queue_metadata_packet =
                &(reinterpret_cast<hsa_amd_metadata_barrier_packet_t*>(
                    queue_base_))[index];
-          SetPacket(packet, header, queue_metadata_packet);
+          if (use_movdir64b) {
+            SetMetadataPacketMovdir64b(packet, header, queue_metadata_packet);
+          } else {
+            SetPacket(packet, header, queue_metadata_packet, device_mem_ring_buf);
+          }
         }
+      }
+
+      //! Whether metadata prefetch is active for the current queue (i.e. the
+      //! queue has a metadata ring buffer and prefetch is enabled). Used to gate
+      //! metadata capture on the graph path.
+      bool Active() const { return IsAttached(); }
+
+      //! Return the metadata ring base (nullptr when not attached).
+      void* QueueBase() const { return queue_base_; }
+
+      //! Build the metadata-prefetch packet for a captured (graph) dispatch into a
+      //! caller-provided, zero-initialized host buffer. Mirrors SetMetadata but
+      //! performs no queue write, no NT/MOVDIR64B stores, and no store fences --
+      //! the buffer is plain host memory that is flattened and (later) copied to
+      //! the metadata ring buffer at launch time. Returns true if a metadata
+      //! packet was produced. |dst| must be at least
+      //! sizeof(hsa_amd_metadata_kernel_dispatch_packet_t) bytes.
+      template <class AqlPacket>
+      inline bool CaptureMetadata(AqlPacket* packet, uint16_t header, uint8_t* dst) {
+        if (!IsAttached() || dst == nullptr) {
+          return false;
+        }
+        if constexpr (std::is_same_v<AqlPacket, hsa_kernel_dispatch_packet_t>) {
+          if (pending_descriptor_ == nullptr) {
+            return false;
+          }
+          auto* m = reinterpret_cast<hsa_amd_metadata_kernel_dispatch_packet_t*>(dst);
+          // dst is a freshly zeroed host buffer: treat it as the staging target.
+          uint32_t metadata_header = FillKernelDispatchMetadata(packet, header, m, true);
+          m->header0 = metadata_header;
+          m->header1 = metadata_header;
+          m->header2 = metadata_header;
+          m->header3 = metadata_header;
+          return true;
+        } else if constexpr (std::is_same_v<AqlPacket, hsa_barrier_and_packet_t> ||
+                             std::is_same_v<AqlPacket, hsa_amd_barrier_value_packet_t>) {
+          auto* m = reinterpret_cast<hsa_amd_metadata_barrier_packet_t*>(dst);
+          const uint32_t metadata_header = GetType(header) | metadata_version_header_;
+          if (packet->completion_signal.handle) {
+            auto* signal = reinterpret_cast<amd_signal_t*>(packet->completion_signal.handle);
+            m->event_id = signal->event_id;
+          }
+          m->header0 = metadata_header;
+          m->header1 = metadata_header;
+          m->header2 = metadata_header;
+          m->header3 = metadata_header;
+          return true;
+        }
+        return false;
       }
 
       //! Set the launch descriptor version (called once from VirtualGPU::create)
@@ -433,28 +495,57 @@ class VirtualGPU : public device::VirtualDevice {
         return (header >> HSA_PACKET_HEADER_TYPE) & ((1 << HSA_PACKET_HEADER_WIDTH_TYPE) - 1);
       }
 
-      //! Set the metadata prefetch aql packet for kernel dispatch
+      //! Write the metadata prefetch packet for kernel dispatch.
+      //! Unified function covering MOVDIR64B, legacy+device-mem (staged NT),
+      //! and legacy+system-mem (direct write) paths.  The assembly logic is
+      //! shared; only the final write to the ring buffer differs.
       void SetPacket(hsa_kernel_dispatch_packet_t* aql, uint16_t header,
-                     hsa_amd_metadata_kernel_dispatch_packet_t* metadata);
+                     hsa_amd_metadata_kernel_dispatch_packet_t* metadata,
+                     bool use_movdir64b, bool device_mem_ring_buf);
 
-      //! Set the metadata prefetch aql packet for barrier.
+      //! Fill the body (everything except the 4 header dwords) of a kernel-dispatch
+      //! metadata packet from |aql| and the staged descriptor/preload state. Returns
+      //! the header dword value the caller should write into header0..header3.
+      //! |target_is_zeroed| signals that |metadata| is already zero-initialized so
+      //! redundant memsets of required-zero fields can be skipped. Shared by the
+      //! queue-write path (SetPacket) and the graph-capture path (CaptureMetadata).
+      uint32_t FillKernelDispatchMetadata(hsa_kernel_dispatch_packet_t* aql, uint16_t header,
+                                          hsa_amd_metadata_kernel_dispatch_packet_t* metadata,
+                                          bool target_is_zeroed);
+
+      //! Set the metadata prefetch aql packet for barrier (legacy NT store path).
       //! The CP invalidates headers after completion, so only header0
       //! and event_id need to be written.
-      //! Read event_id directly from amd_signal_t to avoid the hsa_amd_signal_get_event_id
-      //! API overhead. Only interrupt signals carry a valid event_id.
       template <class AqlBarrierPacket>
       void SetPacket(AqlBarrierPacket* aql, uint16_t header,
-                     hsa_amd_metadata_barrier_packet_t* metadata) const {
+                     hsa_amd_metadata_barrier_packet_t* metadata,
+                     bool device_mem_ring_buf) const {
         if (aql->completion_signal.handle) {
           auto* signal = reinterpret_cast<amd_signal_t*>(aql->completion_signal.handle);
           metadata->event_id = signal->event_id;
         } else {
           metadata->event_id = 0;
         }
-        // Plain store is sufficient: the subsequent packet_store_release on the main
-        // AQL barrier header provides a release fence that orders all metadata writes
-        // (event_id and header) before the CP sees the valid barrier packet.
-        metadata->header0 = GetType(header);
+        if (device_mem_ring_buf) {
+          amd::nontemporalStoreFence();
+        }
+        metadata->header0 = GetType(header) | metadata_version_header_;
+      }
+
+      //! Set the metadata prefetch aql packet for barrier (MOVDIR64B path).
+      //! Only header0 + event_id are meaningful; they live in the first
+      //! 64-byte segment.  One MOVDIR64B writes both atomically (no sfence).
+      template <class AqlBarrierPacket>
+      void SetMetadataPacketMovdir64b(AqlBarrierPacket* aql, uint16_t header,
+                              hsa_amd_metadata_barrier_packet_t* metadata) {
+        alignas(64) uint8_t seg0[64] = {};
+        *reinterpret_cast<uint32_t*>(seg0) = GetType(header) | metadata_version_header_;
+        auto& event_id = *reinterpret_cast<uint32_t*>(seg0 + 4);
+        if (aql->completion_signal.handle) {
+          auto* signal = reinterpret_cast<amd_signal_t*>(aql->completion_signal.handle);
+          event_id = signal->event_id;
+        }
+        amd::movdir64b_copy64(metadata, seg0);
       }
 
       void* queue_base_ = nullptr;        //!< The buffer base of prefetching queue
@@ -548,7 +639,7 @@ class VirtualGPU : public device::VirtualDevice {
   hsa_queue_t* gpu_queue() { return gpu_queue_; }
 
   //! Set the active HW queue and keep the metadata preloader in sync.
-  void SetGpuQueue(hsa_queue_t* queue, void* metadata_ring_buffer = nullptr);
+  void SetGpuQueue(hsa_queue_t* queue);
 
   //! Snapshot the current HW queue as preferred for future re-acquisition (used by graph launch).
   //! Only updates if the queue is still valid — avoids clobbering a hint saved by ReleaseHwQueue.
@@ -662,7 +753,7 @@ class VirtualGPU : public device::VirtualDevice {
                          bool blocking = true, bool attach_signal = false);
 
   //! Fast-path dispatch: pre-built flat contiguous buffer
-  bool dispatchAqlPacketBatchFlat(const std::vector<uint8_t>& flatPacketData,
+  bool dispatchAqlPacketBatchFlat(const amd::AlignedVector64<uint8_t>& flatPacketData,
                                   const std::vector<uint32_t>& validFullHeaders,
                                   amd::AccumulateCommand* vcmd = nullptr,
                                   bool attach_signal = false,
@@ -687,6 +778,16 @@ class VirtualGPU : public device::VirtualDevice {
                                   bool skipTs = false,
                                   hsa_signal_t completionSignal = hsa_signal_t{0});
   void initializeDispatchPacket(hsa_kernel_dispatch_packet_t* packet, amd::NDRangeContainer& sizes);
+
+  //! Write an AQL packet to the ring buffer with metadata prefetch.
+  //! Selects MOVDIR64B only for device-memory queues with CPU support;
+  //! otherwise uses the legacy NT-store path.
+  template <typename AqlPacket>
+  void writePacketToRingBuffer(AqlPacket* aql_loc, AqlPacket* packet,
+                               uint16_t header, uint16_t rest, uint64_t slot_index);
+
+  //! Ring the queue doorbell via direct UC store or ROCr signal.
+  void ringQueueDoorbell(uint64_t index);
 
   void resetKernArgPool() { managed_kernarg_buffer_.ResetPool(); }
 
@@ -826,9 +927,13 @@ class VirtualGPU : public device::VirtualDevice {
   //! as its HwEvent so query/sync observe correct readiness. Released on reset.
   void* last_barrier_hw_event_ = nullptr;
   hsa_agent_t gpu_device_;  //!< Physical device
-  hsa_queue_t* gpu_queue_;  //!< Active queue associated with a vgpu
-  hsa_barrier_and_packet_t barrier_packet_ {};
-  hsa_amd_barrier_value_packet_t barrier_value_packet_ {};
+  hsa_queue_t* gpu_queue_;                //!< Active queue associated with a vgpu
+  bool device_mem_ring_buf_ = false;           //!< Queue ring buffer is in device memory
+  //! Cached hardware doorbell for the active queue (UC MMIO). Non-null only when
+  //! DEBUG_CLR_DIRECT_DOORBELL is enabled and the doorbell id query succeeded.
+  volatile uint64_t* doorbell_ptr_ = nullptr;
+  alignas(64) hsa_barrier_and_packet_t barrier_packet_ {};
+  alignas(64) hsa_amd_barrier_value_packet_t barrier_value_packet_ {};
 
   uint64_t cached_read_dispatch_id_ = 0;  //!< Cached read_dispatch_id to avoid DRAM reads
                                           //!< when queue is not full. GPU updates to
@@ -848,6 +953,9 @@ class VirtualGPU : public device::VirtualDevice {
   uint schedulerThreads_;      //!< The number of scheduler threads
 
   hsa_queue_t* schedulerQueue_;
+  //! Cached hardware doorbell for the scheduler queue (UC MMIO). Non-null only when
+  //! DEBUG_CLR_DIRECT_DOORBELL is enabled and the doorbell id query succeeded.
+  volatile uint64_t* schedulerDoorbell_ = nullptr;
 
   std::thread schedulerQueueThread_;                  //!< Host thread that monitors the scheduler queue
   std::atomic<bool> schedulerQueueThreadRunning_;     //!< Flag to indicate if the thread is running

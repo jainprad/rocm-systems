@@ -1627,6 +1627,7 @@ void GraphExec::PacketBatch::rebuildFilteredLists(
   enabledKernelNames.reserve(dispatchPackets.size());
   filteredFlatPacketData.reserve(dispatchPackets.size() * kAqlPktSize);
   filteredValidPacketFullHeaders.reserve(dispatchPackets.size());
+  filteredFlatMetadataData.reserve(dispatchPackets.size() * kMetadataPktSize);
 
   const bool hasMetadata = !dispatchMetadataPackets.empty();
 
@@ -2052,8 +2053,10 @@ hipError_t GraphExec::UpdateAQLPacket(hip::GraphNode* node) {
 // Append one 64-byte AQL packet to a flat buffer: copies the body, saves the original full_header
 // and invalidates the header.
 void GraphExec::PacketBatch::appendPacketToFlatBuffer(const uint8_t* pkt_raw,
-                                                      std::vector<uint8_t>& flatData,
-                                                      std::vector<uint32_t>& fullHeaders) {
+                                                      const uint8_t* metadata_raw,
+                                                      amd::AlignedVector64<uint8_t>& flatData,
+                                                      std::vector<uint32_t>& fullHeaders,
+                                                      amd::AlignedVector64<uint8_t>& flatMetadata) {
   static constexpr size_t kSigOff = 56;
   const size_t baseOff = flatData.size();
   flatData.insert(flatData.end(), pkt_raw, pkt_raw + kAqlPktSize);
@@ -2070,6 +2073,14 @@ void GraphExec::PacketBatch::appendPacketToFlatBuffer(const uint8_t* pkt_raw,
   memcpy(dst, &kInvalidAqlHeader, sizeof(kInvalidAqlHeader));
   // Zero completion signal; ApplyHwEventPatches re-patches it directly via flat_packet pointers.
   memset(dst + kSigOff, 0, sizeof(uint64_t));
+
+  // Append the matching metadata-prefetch packet so flatMetadata stays index-
+  // aligned with flatData. A nullptr |metadata_raw| yields a zeroed slot.
+  const size_t metaOff = flatMetadata.size();
+  flatMetadata.insert(flatMetadata.end(), kMetadataPktSize, 0);
+  if (metadata_raw != nullptr) {
+    memcpy(flatMetadata.data() + metaOff, metadata_raw, kMetadataPktSize);
+  }
 }
 
 // ================================================================================================
@@ -2082,8 +2093,12 @@ void GraphExec::PacketBatch::rebuildFlatBuffer() {
   filteredCacheValid = false;
   flatPacketData.reserve(n * kAqlPktSize);
   validPacketFullHeaders.reserve(n);
-  for (const uint8_t* pkt_raw : dispatchPackets) {
-    appendPacketToFlatBuffer(pkt_raw, flatPacketData, validPacketFullHeaders);
+  flatMetadataData.reserve(n * kMetadataPktSize);
+  for (size_t i = 0; i < n; ++i) {
+    const uint8_t* metadata_raw =
+        (i < dispatchMetadataPackets.size()) ? dispatchMetadataPackets[i] : nullptr;
+    appendPacketToFlatBuffer(dispatchPackets[i], metadata_raw, flatPacketData,
+                             validPacketFullHeaders, flatMetadataData);
   }
   // Build flat metadata buffer (kMetadataPktSize per slot).
   // Entries without metadata (barriers) are zero-filled.
@@ -2336,7 +2351,7 @@ hipError_t GraphExec::EnqueueSegment(const Segment& segment, hip::Stream* stream
     }
 
     const std::vector<const std::string*>* kernelNamesToDispatch;
-    const std::vector<uint8_t>* flatData;
+    const amd::AlignedVector64<uint8_t>* flatData;
     const std::vector<uint32_t>* flatHdrs;
     const std::vector<uint8_t>* metaData = nullptr;
 
@@ -3040,13 +3055,7 @@ void GraphKernelArgManager::ReadBackOrFlush() {
   for (const auto& kernarg : kernarg_graph_) {
     const auto kernArgImpl = kernarg.first->settings().kernel_arg_impl_;
 
-    if (kernArgImpl == KernelArgImpl::DeviceKernelArgsHDP) {
-      // Trigger HDP flush
-      *kernarg.first->info().hdpMemFlushCntl = 1u;
-      // Read back to ensure flush completion
-      volatile int kSentinel = *reinterpret_cast<volatile int*>(kernarg.first->info().hdpMemFlushCntl);
-      (void)kSentinel; // Suppress unused variable warning
-    } else if (kernArgImpl == KernelArgImpl::DeviceKernelArgsReadback) {
+    if (kernArgImpl == KernelArgImpl::DeviceKernelArgsReadback) {
       const auto& pool = kernarg.second.back();
       if (pool.kernarg_pool_addr_ == 0) {
         continue;

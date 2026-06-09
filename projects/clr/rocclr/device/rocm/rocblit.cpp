@@ -2017,8 +2017,8 @@ bool KernelBlitManager::copyBufferRect(device::Memory& srcMemory, device::Memory
       ((dstRectIn.rowPitch_ % 4) == 0) && ((dstRectIn.slicePitch_ % 4) == 0);
   const bool hostDeviceRect =
       srcMemory.isHostMemDirectAccess() != dstMemory.isHostMemDirectAccess();
-  const bool sdmaRectWouldSerialize = !dwordAlignedRect && hostDeviceRect &&
-      ((sizeIn[1] * sizeIn[2]) > kSdmaRectRowSerializeLimit);
+  const bool sdmaRectWouldSerialize =
+      !dwordAlignedRect && hostDeviceRect && ((sizeIn[1] * sizeIn[2]) > kSdmaRectRowSerializeLimit);
 
   // Fall into the ROC path for rejected transfers
   if (dev().info().pcie_atomics_ && !sdmaRectWouldSerialize &&

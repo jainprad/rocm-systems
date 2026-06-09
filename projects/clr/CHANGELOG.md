@@ -4,6 +4,17 @@ Full documentation for HIP is available at [rocm.docs.amd.com](https://rocm.docs
 
 ## HIP 7.14 for ROCm 7.14
 
+### Optimizations
+
+* `hipMemcpy2D`/`hipMemcpy2DAsync`: avoid a severe slowdown for narrow, tall host&harr;device copies (small `width`, large `height`). When the row/slice pitch is not 4-byte aligned (for example `width = 1` byte), `KernelBlitManager::copyBufferRect` previously used the SDMA rect path, which falls back to one `hsa_amd_memory_async_copy` per row. For a 1&nbsp;MB transfer of 1,048,576 rows &times; 1 byte on gfx942 this issued ~1M single-byte SDMA copies and took several seconds, while the equivalent NVIDIA/CUDA path completes in a few milliseconds. Such narrow, non-dword-aligned 2D copies are now routed to the shader `BlitCopyBufferRect` kernel (single dispatch). Measured before/after on gfx942 / ROCm 7.2 (1,048,576 rows, best-of-3):
+    - width=1, H2D pinned: 8615.79 ms &rarr; 0.283 ms
+    - width=1, H2D pageable: 8627.17 ms &rarr; 0.284 ms
+    - width=1, D2H pinned: 7908.23 ms &rarr; 0.334 ms
+    - width=1, D2H pageable: 7912.22 ms &rarr; 0.335 ms
+    - dword-aligned widths (4 / 8 / 128 bytes): unchanged
+
+  `rocprofv3` confirms the per-row submissions (one `MEMORY_COPY` record per row) collapse into a single `__amd_rocclr_copyBufferRect` dispatch. Copies at or below the 256-row threshold are unaffected.
+
 ### Added
 * New HIP APIs
     - Execution Context Management: Support for the following APIs for parity with corresponding CUDA APIs.

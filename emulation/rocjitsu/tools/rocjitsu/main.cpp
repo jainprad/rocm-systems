@@ -11,16 +11,27 @@
 
 #include "rocjitsu/vm/rj_vm.h"
 
+#include "rocjitsu/config/config_loader.h"
+#include "rocjitsu/config/dbt_guest_config.h"
 #include "rocjitsu/kmd/linux/rpc.h"
 #include "rocjitsu/version.h"
 
+#include "embedded_schema.h"
+
+#include <algorithm>
+#include <cctype>
 #include <cerrno>
+#include <charconv>
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <iostream>
+#include <mutex>
+#include <optional>
 #include <stop_token>
 #include <string_view>
 #include <sys/mman.h>
@@ -30,9 +41,12 @@
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 using namespace rocjitsu;
+
+namespace {
 
 static pid_t peer_pid_for_socket(int fd) {
   struct ucred cred {};
@@ -305,6 +319,33 @@ static std::string find_interposer_lib() {
   return {};
 }
 
+static std::string find_hooks_lib() {
+  char self[4096];
+  auto n = readlink("/proc/self/exe", self, sizeof(self) - 1);
+  if (n <= 0)
+    return {};
+  self[n] = '\0';
+  auto bin_dir = std::filesystem::path(self).parent_path();
+  for (auto &candidate : {
+           bin_dir / ".." / "lib" / "librocjitsu_hooks.so",
+           bin_dir / ".." / ".." / "lib" / "rocjitsu" / "src" / "rocjitsu" / "hooks" /
+               "librocjitsu_hooks.so",
+       }) {
+    if (std::filesystem::exists(candidate))
+      return std::filesystem::canonical(candidate).string();
+  }
+  return {};
+}
+
+static void prepend_env_path(const char *name, const std::string &value) {
+  if (const char *old_value = std::getenv(name); old_value && *old_value) {
+    std::string combined = value + ":" + old_value;
+    setenv(name, combined.c_str(), 1);
+    return;
+  }
+  setenv(name, value.c_str(), 1);
+}
+
 static bool write_config_file(const std::string &config_path) {
   auto cfg_file = rpc_default_config_file_path();
   std::filesystem::create_directories(std::filesystem::path(cfg_file).parent_path());
@@ -322,6 +363,140 @@ static void cleanup_runtime_files() {
   unlink(sock_file.c_str());
 }
 
+struct KfdGpuOrdinal {
+  uint32_t ordinal = 0;
+  uint32_t node_id = 0;
+  uint32_t gpu_id = 0;
+};
+
+static std::optional<uint32_t> parse_u32(std::string_view text) {
+  uint32_t value = 0;
+  auto *begin = text.data();
+  auto *end = text.data() + text.size();
+  auto [ptr, err] = std::from_chars(begin, end, value);
+  if (err != std::errc{} || ptr != end)
+    return std::nullopt;
+  return value;
+}
+
+static std::string_view trim(std::string_view text) {
+  while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front())))
+    text.remove_prefix(1);
+  while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back())))
+    text.remove_suffix(1);
+  return text;
+}
+
+static std::optional<uint32_t> read_u32_file(const std::filesystem::path &path) {
+  std::ifstream in(path);
+  uint32_t value = 0;
+  if (!(in >> value))
+    return std::nullopt;
+  return value;
+}
+
+static std::vector<KfdGpuOrdinal> real_kfd_gpu_ordinals() {
+  std::filesystem::path nodes_dir = "/sys/devices/virtual/kfd/kfd/topology/nodes";
+  if (!std::filesystem::exists(nodes_dir))
+    nodes_dir = "/sys/class/kfd/kfd/topology/nodes";
+
+  std::vector<std::pair<uint32_t, uint32_t>> nodes;
+  std::error_code ec;
+  for (const auto &entry : std::filesystem::directory_iterator(nodes_dir, ec)) {
+    if (!entry.is_directory(ec))
+      continue;
+
+    std::string name = entry.path().filename().string();
+    auto node_id = parse_u32(name);
+    if (!node_id)
+      continue;
+
+    auto gpu_id = read_u32_file(entry.path() / "gpu_id");
+    if (gpu_id && *gpu_id != 0)
+      nodes.emplace_back(*node_id, *gpu_id);
+  }
+
+  std::sort(nodes.begin(), nodes.end(),
+            [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
+
+  std::vector<KfdGpuOrdinal> gpus;
+  gpus.reserve(nodes.size());
+  for (uint32_t ordinal = 0; ordinal < nodes.size(); ++ordinal)
+    gpus.push_back({ordinal, nodes[ordinal].first, nodes[ordinal].second});
+  return gpus;
+}
+
+static bool append_unique(std::vector<std::string> *tokens, std::string token) {
+  if (token.empty())
+    return false;
+  if (std::find(tokens->begin(), tokens->end(), token) != tokens->end())
+    return false;
+  tokens->push_back(std::move(token));
+  return true;
+}
+
+static std::string join_comma(const std::vector<std::string> &tokens) {
+  std::string result;
+  for (size_t i = 0; i < tokens.size(); ++i) {
+    if (i != 0)
+      result += ',';
+    result += tokens[i];
+  }
+  return result;
+}
+
+static void maybe_expand_rocr_visible_devices(const rocjitsu::config::DbtGuestConfig &dbt_guest) {
+  const char *visible = std::getenv("ROCR_VISIBLE_DEVICES");
+  if (visible == nullptr || *visible == '\0')
+    return;
+
+  std::vector<KfdGpuOrdinal> gpus = real_kfd_gpu_ordinals();
+  if (gpus.empty())
+    return;
+
+  uint32_t host_ordinal = 0;
+  if (dbt_guest.host_gpu_id != 0) {
+    auto match = std::find_if(gpus.begin(), gpus.end(), [&](const KfdGpuOrdinal &gpu) {
+      return gpu.gpu_id == dbt_guest.host_gpu_id;
+    });
+    if (match == gpus.end())
+      return;
+    host_ordinal = match->ordinal;
+  }
+
+  const uint32_t guest_ordinal = static_cast<uint32_t>(gpus.size());
+  std::vector<std::string> expanded;
+  std::string_view rest = visible;
+  bool changed = false;
+
+  while (true) {
+    size_t comma = rest.find(',');
+    std::string_view raw = comma == std::string_view::npos ? rest : rest.substr(0, comma);
+    std::string_view token = trim(raw);
+    if (!token.empty()) {
+      std::optional<uint32_t> ordinal = parse_u32(token);
+      if (ordinal && (*ordinal == host_ordinal || *ordinal == guest_ordinal)) {
+        // ROCR filters topology before HSA tools callbacks. Include both the
+        // hidden host and appended guest internally so our HSA iteration hook
+        // can present one public replacement agent.
+        changed = append_unique(&expanded, std::to_string(host_ordinal)) || changed;
+        changed = append_unique(&expanded, std::to_string(guest_ordinal)) || changed;
+      } else {
+        changed = append_unique(&expanded, std::string(token)) || changed;
+      }
+    }
+
+    if (comma == std::string_view::npos)
+      break;
+    rest.remove_prefix(comma + 1);
+  }
+
+  std::string rewritten = join_comma(expanded);
+  if (!rewritten.empty() && rewritten != visible) {
+    setenv("ROCR_VISIBLE_DEVICES", rewritten.c_str(), 1);
+  }
+}
+
 static void print_usage() {
   std::cerr
       << "Usage: rocjitsu --config <config.json> [--daemon|--attach] -- <app> [args...]\n"
@@ -337,6 +512,8 @@ static void print_usage() {
          "  --version, -v     Print version and exit\n"
          "  --help, -h        Print this help and exit\n";
 }
+
+} // namespace
 
 int main(int argc, char *argv[]) {
   std::signal(SIGPIPE, SIG_IGN);
@@ -383,6 +560,21 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  rocjitsu::config::DbtGuestConfig dbt_guest_config;
+  try {
+    dbt_guest_config = rocjitsu::config::load_dbt_guest_config_from_file(abs_config);
+    if (!dbt_guest_config.enabled)
+      (void)rocjitsu::config::load_config(abs_config, rocjitsu::kEmbeddedSchema);
+  } catch (const std::exception &e) {
+    std::cerr << std::format("rocjitsu: failed to parse config: {}\n", e.what());
+    return 1;
+  }
+  const bool dbt_guest_mode = dbt_guest_config.enabled;
+  if (dbt_guest_mode && (daemon_mode || attach_mode)) {
+    std::cerr << "rocjitsu: dbt_guest mode currently supports local launch only\n";
+    return 1;
+  }
+
   bool has_app = (separator_idx >= 0 && separator_idx + 1 < argc);
 
   if (daemon_mode && !has_app)
@@ -400,6 +592,19 @@ int main(int argc, char *argv[]) {
   if (lib_path.empty()) {
     std::cerr << "rocjitsu: could not find librocjitsu_kmd.so\n";
     return 1;
+  }
+
+  std::string hooks_path;
+  if (dbt_guest_mode) {
+    if (dbt_guest_config.guest_isa.empty() || dbt_guest_config.host_isa.empty()) {
+      std::cerr << "rocjitsu: dbt_guest requires guest_isa and host_isa\n";
+      return 1;
+    }
+    hooks_path = find_hooks_lib();
+    if (hooks_path.empty()) {
+      std::cerr << "rocjitsu: could not find librocjitsu_hooks.so\n";
+      return 1;
+    }
   }
 
   if (attach_mode) {
@@ -439,7 +644,15 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  setenv("LD_PRELOAD", lib_path.c_str(), 1);
+  prepend_env_path("LD_PRELOAD", lib_path);
+  if (dbt_guest_mode) {
+    maybe_expand_rocr_visible_devices(dbt_guest_config);
+    // The HSA hook still uses the legacy tools callback path. Disable only the
+    // rocprofiler-register table-delivery path so it cannot validate an
+    // unshadowed table before rocjitsu installs guest-agent wrappers.
+    setenv("HSA_TOOLS_DISABLE_REGISTER", "1", 1);
+    setenv("HSA_TOOLS_LIB", hooks_path.c_str(), 1);
+  }
   execvp(app_argv[0], app_argv);
 
   std::cerr << std::format("rocjitsu: execvp failed: {}\n", strerror(errno));

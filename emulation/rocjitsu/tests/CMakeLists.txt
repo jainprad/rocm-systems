@@ -229,6 +229,11 @@ set_tests_properties(
 )
 
 add_executable(hsa_hooks_unit_test dbt/hsa_hooks_unit_test.cpp)
+target_compile_definitions(
+    hsa_hooks_unit_test
+    PRIVATE
+        RJ_HOOK_UNIT_CONFIG_PATH="${CMAKE_SOURCE_DIR}/configs/guest_gfx950_on_gfx1201.json"
+)
 target_include_directories(
     hsa_hooks_unit_test
     PRIVATE
@@ -244,13 +249,7 @@ target_include_directories(
 )
 target_link_libraries(
     hsa_hooks_unit_test
-    PRIVATE
-        ${RJ_OBJECT_LIBS}
-        rocjitsu_dbt_config
-        util
-        flatbuffers
-        Threads::Threads
-        GTest::gtest_main
+    PRIVATE rocjitsu_hooks Threads::Threads GTest::gtest_main
 )
 rj_configure_target(hsa_hooks_unit_test TEST)
 gtest_discover_tests(hsa_hooks_unit_test)

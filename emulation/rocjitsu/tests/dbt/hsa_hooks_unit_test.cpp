@@ -7,11 +7,20 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
-#include "rocjitsu/hooks/rj_hsa_dbt_hooks.cpp"
+#include "hsa/hsa_api_trace_minimal.h"
+#include "rocjitsu/kmd/linux/rpc.h"
+
+extern "C" bool OnLoad(HsaApiTable *table, uint64_t runtime_version, uint64_t failed_tool_count,
+                       const char *const *failed_tool_names);
+extern "C" void OnUnload();
 
 namespace {
 
@@ -30,6 +39,8 @@ bool g_block_guest_pool_iteration = false;
 bool g_guest_pool_iteration_entered = false;
 bool g_release_guest_pool_iteration = false;
 int g_fake_shutdown_calls = 0;
+hsa_amd_memory_pool_t g_last_allocate_pool{};
+int g_fake_allocation_storage = 0;
 
 const char *isa_name(hsa_isa_t isa) {
   if (isa.handle == kGuestIsa.handle)
@@ -134,6 +145,14 @@ hsa_status_t HSA_API fake_executable_load_agent_code_object(hsa_executable_t, hs
   return HSA_STATUS_SUCCESS;
 }
 
+hsa_status_t HSA_API fake_amd_memory_pool_allocate(hsa_amd_memory_pool_t memory_pool, size_t,
+                                                   uint32_t, void **ptr) {
+  g_last_allocate_pool = memory_pool;
+  if (ptr != nullptr)
+    *ptr = &g_fake_allocation_storage;
+  return HSA_STATUS_SUCCESS;
+}
+
 hsa_status_t HSA_API fake_amd_agent_iterate_memory_pools(
     hsa_agent_t agent, hsa_status_t (*callback)(hsa_amd_memory_pool_t, void *), void *data) {
   if (callback == nullptr)
@@ -179,21 +198,6 @@ hsa_status_t HSA_API fake_amd_memory_pool_get_info(hsa_amd_memory_pool_t,
   return HSA_STATUS_ERROR_INVALID_ARGUMENT;
 }
 
-HookConfig fake_config() {
-  auto host = parse_target("gfx1201");
-  auto guest = parse_target("gfx950");
-  if (!host || !guest)
-    std::abort();
-
-  HookConfig config;
-  config.target = *host;
-  config.source_override = *guest;
-  config.guest_target = *guest;
-  config.log_level = kLogDisabled;
-  config.signal_backtrace = false;
-  return config;
-}
-
 struct FakeApiTable {
   CoreApiTable core{};
   AmdExtTable amd{};
@@ -217,14 +221,29 @@ struct FakeApiTable {
     core.hsa_executable_load_agent_code_object_fn = fake_executable_load_agent_code_object;
     amd.hsa_amd_agent_iterate_memory_pools_fn = fake_amd_agent_iterate_memory_pools;
     amd.hsa_amd_memory_pool_get_info_fn = fake_amd_memory_pool_get_info;
+    amd.hsa_amd_memory_pool_allocate_fn = fake_amd_memory_pool_allocate;
   }
 };
 
+void write_runtime_config_path() {
+  std::filesystem::path runtime_dir =
+      std::filesystem::temp_directory_path() /
+      ("rocjitsu-hsa-hooks-unit-" + std::to_string(static_cast<long long>(::getpid())));
+  std::filesystem::create_directories(runtime_dir);
+  setenv("ROCJITSU_RUNTIME_DIR", runtime_dir.c_str(), 1);
+
+  std::ofstream config_path(rocjitsu::rpc_default_config_file_path());
+  config_path << RJ_HOOK_UNIT_CONFIG_PATH << '\n';
+}
+
 class InstalledHook {
 public:
-  explicit InstalledHook(FakeApiTable &api)
-      : installed_(layer().install(&api.table, fake_config())) {}
-  ~InstalledHook() { layer().uninstall(); }
+  explicit InstalledHook(FakeApiTable &api) {
+    OnUnload();
+    write_runtime_config_path();
+    installed_ = OnLoad(&api.table, 0, 0, nullptr);
+  }
+  ~InstalledHook() { OnUnload(); }
 
   [[nodiscard]] bool installed() const { return installed_; }
 
@@ -248,14 +267,14 @@ void release_pool_blocker() {
 }
 
 TEST(HsaHooksUnitTest, IterateAgentsDropsGuestOwnSlotWhenGuestAppearsFirst) {
-  layer().uninstall();
   reset_pool_blocker(false);
   FakeApiTable api;
   InstalledHook hook(api);
   ASSERT_TRUE(hook.installed());
+  ASSERT_NE(api.core.hsa_iterate_agents_fn, fake_iterate_agents);
 
   std::vector<uint64_t> seen;
-  hsa_status_t status = rj_iterate_agents(
+  hsa_status_t status = api.core.hsa_iterate_agents_fn(
       [](hsa_agent_t agent, void *data) -> hsa_status_t {
         static_cast<std::vector<uint64_t> *>(data)->push_back(agent.handle);
         return HSA_STATUS_SUCCESS;
@@ -267,15 +286,18 @@ TEST(HsaHooksUnitTest, IterateAgentsDropsGuestOwnSlotWhenGuestAppearsFirst) {
 }
 
 TEST(HsaHooksUnitTest, UninstallDoesNotWaitForPoolMapperDiscoveryLock) {
-  layer().uninstall();
   reset_pool_blocker(true);
+  g_last_allocate_pool = {};
   FakeApiTable api;
   InstalledHook hook(api);
   ASSERT_TRUE(hook.installed());
-  ASSERT_EQ(AgentMapper::instance().guest_agent().handle, kGuestAgent.handle);
+  ASSERT_NE(api.amd.hsa_amd_memory_pool_allocate_fn, fake_amd_memory_pool_allocate);
 
-  hsa_amd_memory_pool_t mapped_pool{};
-  std::thread mapper_thread([&] { mapped_pool = MemoryPoolMapper::instance().map(kGuestPool); });
+  hsa_status_t allocate_status = HSA_STATUS_ERROR;
+  std::thread mapper_thread([&] {
+    void *ptr = nullptr;
+    allocate_status = api.amd.hsa_amd_memory_pool_allocate_fn(kGuestPool, 4096, 0, &ptr);
+  });
 
   bool mapper_entered_pool_iteration = false;
   {
@@ -292,7 +314,7 @@ TEST(HsaHooksUnitTest, UninstallDoesNotWaitForPoolMapperDiscoveryLock) {
 
   bool uninstall_done = false;
   std::thread uninstall_thread([&] {
-    layer().uninstall();
+    OnUnload();
     std::lock_guard lock(g_pool_mutex);
     uninstall_done = true;
     g_pool_cv.notify_all();
@@ -310,25 +332,25 @@ TEST(HsaHooksUnitTest, UninstallDoesNotWaitForPoolMapperDiscoveryLock) {
   mapper_thread.join();
 
   EXPECT_TRUE(completed_without_pool_release);
-  EXPECT_EQ(mapped_pool.handle, kHostPool.handle);
+  EXPECT_EQ(allocate_status, HSA_STATUS_SUCCESS);
+  EXPECT_EQ(g_last_allocate_pool.handle, kHostPool.handle);
   reset_pool_blocker(false);
 }
 
 TEST(HsaHooksUnitTest, GuestShutdownKeepsHookInstalledForProcessLifetime) {
-  layer().uninstall();
   reset_pool_blocker(false);
   g_fake_shutdown_calls = 0;
   FakeApiTable api;
   InstalledHook hook(api);
   ASSERT_TRUE(hook.installed());
-  ASSERT_EQ(api.core.hsa_shut_down_fn, rj_shut_down);
+  auto *patched_shutdown = api.core.hsa_shut_down_fn;
+  ASSERT_NE(patched_shutdown, fake_shut_down);
 
-  EXPECT_EQ(rj_shut_down(), HSA_STATUS_SUCCESS);
+  EXPECT_EQ(patched_shutdown(), HSA_STATUS_SUCCESS);
 
   EXPECT_EQ(g_fake_shutdown_calls, 0);
-  EXPECT_EQ(api.core.hsa_shut_down_fn, rj_shut_down);
-  EXPECT_EQ(layer().shut_down(), fake_shut_down);
-  EXPECT_TRUE(layer().config().has_value());
+  EXPECT_EQ(api.core.hsa_shut_down_fn, patched_shutdown);
+  EXPECT_NE(api.core.hsa_shut_down_fn, fake_shut_down);
 }
 
 } // namespace

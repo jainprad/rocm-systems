@@ -34,6 +34,7 @@ from utils.utils_common import (
     get_uuid,
     is_only_pc_sampling,
     load_panel_configs,
+    validate_profiling_format,
     validate_roofline_csv,
 )
 
@@ -310,6 +311,8 @@ class OmniAnalyze_Base:
             args.path[0][0]
         )
         profiling_config = self.get_profiling_config()
+
+        validate_profiling_format(profiling_config)
 
         needs_ml_api_trace = getattr(
             args, "torch_operator", None

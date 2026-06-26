@@ -169,7 +169,7 @@ void signal_backtrace_handler(int signo, siginfo_t *info, void *context) {
   }
 
   const char header[] = "\n[rocjitsu-hooks] signal backtrace\n";
-  (void)::write(STDERR_FILENO, header, sizeof(header) - 1);
+  [[maybe_unused]] const ssize_t written = ::write(STDERR_FILENO, header, sizeof(header) - 1);
   void *frames[128];
   int count = ::backtrace(frames, 128);
   ::backtrace_symbols_fd(frames, count, STDERR_FILENO);

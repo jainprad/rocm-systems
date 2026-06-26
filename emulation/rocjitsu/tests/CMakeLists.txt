@@ -128,6 +128,7 @@ target_link_libraries(
     PRIVATE
         ${RJ_OBJECT_LIBS}
         rocjitsu_kmd
+        rocjitsu_dbt_config
         util
         flatbuffers
         Threads::Threads
@@ -185,7 +186,12 @@ set(RJ_KMD_PRELOAD_ENV
 )
 
 add_executable(guest_kfd_test guest_kfd_test.cpp)
-target_link_libraries(guest_kfd_test PRIVATE GTest::gtest_main)
+target_include_directories(
+    guest_kfd_test
+    PRIVATE ${CMAKE_SOURCE_DIR}/lib/rocjitsu/include ${HSA_INCLUDE_DIR}
+)
+target_link_libraries(guest_kfd_test PRIVATE Threads::Threads GTest::gtest_main)
+rj_configure_target(guest_kfd_test TEST)
 add_dependencies(guest_kfd_test rocjitsu_bin rocjitsu_kmd_shim rocjitsu_hooks)
 add_test(
     NAME "GuestKfdMultiprocessTest.ForkedChildrenDoNotRemoveParentOverlay"
@@ -196,10 +202,58 @@ add_test(
         --gtest_filter=GuestKfdMultiprocessTest.ForkedChildrenDoNotRemoveParentOverlay
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
 )
+add_test(
+    NAME
+        "GuestKfdMultiprocessTest.ForkedChildDropsInheritedGuestDriverBeforeReopen"
+    COMMAND
+        ${RJ_CLI} --config
+        ${CMAKE_SOURCE_DIR}/configs/guest_gfx950_on_gfx1201.json --
+        $<TARGET_FILE:guest_kfd_test>
+        --gtest_filter=GuestKfdMultiprocessTest.ForkedChildDropsInheritedGuestDriverBeforeReopen
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+)
+add_test(
+    NAME "GuestKfdConcurrencyTest.ConcurrentOpenIoctlAndSysfsRedirect"
+    COMMAND
+        ${RJ_CLI} --config
+        ${CMAKE_SOURCE_DIR}/configs/guest_gfx950_on_gfx1201.json --
+        $<TARGET_FILE:guest_kfd_test>
+        --gtest_filter=GuestKfdConcurrencyTest.ConcurrentOpenIoctlAndSysfsRedirect
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+)
 set_tests_properties(
     "GuestKfdMultiprocessTest.ForkedChildrenDoNotRemoveParentOverlay"
+    "GuestKfdMultiprocessTest.ForkedChildDropsInheritedGuestDriverBeforeReopen"
+    "GuestKfdConcurrencyTest.ConcurrentOpenIoctlAndSysfsRedirect"
     PROPERTIES TIMEOUT 60 SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]"
 )
+
+add_executable(hsa_hooks_unit_test dbt/hsa_hooks_unit_test.cpp)
+target_include_directories(
+    hsa_hooks_unit_test
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/lib/rocjitsu/include
+        ${CMAKE_SOURCE_DIR}/lib/rocjitsu/src
+        ${CMAKE_SOURCE_DIR}/lib/util/include
+        ${GENERATED_DIR}
+)
+target_include_directories(
+    hsa_hooks_unit_test
+    SYSTEM
+    PRIVATE ${HSA_INCLUDE_DIR}
+)
+target_link_libraries(
+    hsa_hooks_unit_test
+    PRIVATE
+        ${RJ_OBJECT_LIBS}
+        rocjitsu_dbt_config
+        util
+        flatbuffers
+        Threads::Threads
+        GTest::gtest_main
+)
+rj_configure_target(hsa_hooks_unit_test TEST)
+gtest_discover_tests(hsa_hooks_unit_test)
 
 # --- rocminfo test (requires rocminfo binary + HSA runtime + CLI launcher) ---
 # Spawns rocminfo via the rocjitsu CLI and validates output.

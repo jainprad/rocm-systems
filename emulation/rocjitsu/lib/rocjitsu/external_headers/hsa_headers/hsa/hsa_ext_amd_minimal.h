@@ -23,6 +23,13 @@ using hsa_amd_sdma_engine_id_t = uint32_t;
 using hsa_amd_pointer_type_t = uint32_t;
 using hsa_amd_copy_direction_t = uint32_t;
 
+// Public hsa_ext_amd.h enum values mirrored by name so ABI renumbering is visible.
+inline constexpr uint32_t HSA_AMD_AGENT_INFO_DRIVER_NODE_ID = 0xA004;
+inline constexpr hsa_amd_memory_pool_info_t HSA_AMD_MEMORY_POOL_INFO_SEGMENT = 0;
+inline constexpr hsa_amd_memory_pool_info_t HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS = 1;
+inline constexpr hsa_amd_memory_pool_info_t HSA_AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_ALLOWED = 5;
+inline constexpr hsa_amd_memory_pool_info_t HSA_AMD_MEMORY_POOL_INFO_LOCATION = 17;
+
 /// @brief Minimal pitched pointer mirror for hsa_amd_memory_async_copy_rect.
 struct hsa_pitched_ptr_t {
   void *base;

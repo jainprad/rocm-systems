@@ -48,7 +48,7 @@ using namespace rocjitsu;
 
 namespace {
 
-static pid_t peer_pid_for_socket(int fd) {
+pid_t peer_pid_for_socket(int fd) {
   struct ucred cred {};
   socklen_t len = sizeof(cred);
   if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0 && cred.pid > 0)
@@ -56,7 +56,7 @@ static pid_t peer_pid_for_socket(int fd) {
   return 0;
 }
 
-static void handle_client(int client_fd, rj_vm_t *vm, pid_t client_pid, std::stop_token stop) {
+void handle_client(int client_fd, rj_vm_t *vm, pid_t client_pid, std::stop_token stop) {
   uint32_t process_id = 0;
   bool connected = true;
 
@@ -221,9 +221,9 @@ static void handle_client(int client_fd, rj_vm_t *vm, pid_t client_pid, std::sto
   ::close(client_fd);
 }
 
-static volatile sig_atomic_t g_listen_fd = -1;
+volatile sig_atomic_t g_listen_fd = -1;
 
-static int run_daemon_server(const char *config_path) {
+int run_daemon_server(const char *config_path) {
   rj_vm_t *vm = nullptr;
   if (rj_vm_create(config_path, RJ_VM_MODE_DAEMON, &vm) != ROCJITSU_STATUS_SUCCESS) {
     std::cerr << std::format("rocjitsu: failed to create VM from {}\n", config_path);
@@ -296,13 +296,23 @@ static int run_daemon_server(const char *config_path) {
   return 0;
 }
 
-static std::string find_interposer_lib() {
-  char self[4096];
-  auto n = readlink("/proc/self/exe", self, sizeof(self) - 1);
-  if (n <= 0)
+std::optional<std::filesystem::path> current_executable_path() {
+  std::vector<char> buffer(256);
+  for (;;) {
+    ssize_t n = readlink("/proc/self/exe", buffer.data(), buffer.size());
+    if (n < 0)
+      return std::nullopt;
+    if (static_cast<size_t>(n) < buffer.size())
+      return std::filesystem::path(std::string(buffer.data(), static_cast<size_t>(n)));
+    buffer.resize(buffer.size() * 2);
+  }
+}
+
+std::string find_interposer_lib() {
+  auto self = current_executable_path();
+  if (!self)
     return {};
-  self[n] = '\0';
-  auto bin_dir = std::filesystem::path(self).parent_path();
+  auto bin_dir = self->parent_path();
   // Installed layout: <prefix>/bin/rocjitsu → <prefix>/lib/librocjitsu_kmd.so
   //                   or <prefix>/bin/rocjitsu → <prefix>/lib64/librocjitsu_kmd.so
   // Build layout: build/tools/rocjitsu/rocjitsu → build/lib/.../librocjitsu_kmd.so
@@ -319,13 +329,11 @@ static std::string find_interposer_lib() {
   return {};
 }
 
-static std::string find_hooks_lib() {
-  char self[4096];
-  auto n = readlink("/proc/self/exe", self, sizeof(self) - 1);
-  if (n <= 0)
+std::string find_hooks_lib() {
+  auto self = current_executable_path();
+  if (!self)
     return {};
-  self[n] = '\0';
-  auto bin_dir = std::filesystem::path(self).parent_path();
+  auto bin_dir = self->parent_path();
   for (auto &candidate : {
            bin_dir / ".." / "lib" / "librocjitsu_hooks.so",
            bin_dir / ".." / ".." / "lib" / "rocjitsu" / "src" / "rocjitsu" / "hooks" /
@@ -337,7 +345,7 @@ static std::string find_hooks_lib() {
   return {};
 }
 
-static void prepend_env_path(const char *name, const std::string &value) {
+void prepend_env_path(const char *name, const std::string &value) {
   if (const char *old_value = std::getenv(name); old_value && *old_value) {
     std::string combined = value + ":" + old_value;
     setenv(name, combined.c_str(), 1);
@@ -346,7 +354,7 @@ static void prepend_env_path(const char *name, const std::string &value) {
   setenv(name, value.c_str(), 1);
 }
 
-static bool write_config_file(const std::string &config_path) {
+bool write_config_file(const std::string &config_path) {
   auto cfg_file = rpc_default_config_file_path();
   std::filesystem::create_directories(std::filesystem::path(cfg_file).parent_path());
   std::ofstream ofs(cfg_file);
@@ -356,7 +364,7 @@ static bool write_config_file(const std::string &config_path) {
   return ofs.good();
 }
 
-static void cleanup_runtime_files() {
+void cleanup_runtime_files() {
   auto cfg_file = rpc_default_config_file_path();
   unlink(cfg_file.c_str());
   auto sock_file = rpc_default_socket_path();
@@ -369,7 +377,7 @@ struct KfdGpuOrdinal {
   uint32_t gpu_id = 0;
 };
 
-static std::optional<uint32_t> parse_u32(std::string_view text) {
+std::optional<uint32_t> parse_u32(std::string_view text) {
   uint32_t value = 0;
   auto *begin = text.data();
   auto *end = text.data() + text.size();
@@ -379,7 +387,7 @@ static std::optional<uint32_t> parse_u32(std::string_view text) {
   return value;
 }
 
-static std::string_view trim(std::string_view text) {
+std::string_view trim(std::string_view text) {
   while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front())))
     text.remove_prefix(1);
   while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back())))
@@ -387,7 +395,7 @@ static std::string_view trim(std::string_view text) {
   return text;
 }
 
-static std::optional<uint32_t> read_u32_file(const std::filesystem::path &path) {
+std::optional<uint32_t> read_u32_file(const std::filesystem::path &path) {
   std::ifstream in(path);
   uint32_t value = 0;
   if (!(in >> value))
@@ -395,7 +403,7 @@ static std::optional<uint32_t> read_u32_file(const std::filesystem::path &path) 
   return value;
 }
 
-static std::vector<KfdGpuOrdinal> real_kfd_gpu_ordinals() {
+std::vector<KfdGpuOrdinal> real_kfd_gpu_ordinals() {
   std::filesystem::path nodes_dir = "/sys/devices/virtual/kfd/kfd/topology/nodes";
   if (!std::filesystem::exists(nodes_dir))
     nodes_dir = "/sys/class/kfd/kfd/topology/nodes";
@@ -426,7 +434,7 @@ static std::vector<KfdGpuOrdinal> real_kfd_gpu_ordinals() {
   return gpus;
 }
 
-static bool append_unique(std::vector<std::string> *tokens, std::string token) {
+bool append_unique(std::vector<std::string> *tokens, std::string token) {
   if (token.empty())
     return false;
   if (std::find(tokens->begin(), tokens->end(), token) != tokens->end())
@@ -435,7 +443,7 @@ static bool append_unique(std::vector<std::string> *tokens, std::string token) {
   return true;
 }
 
-static std::string join_comma(const std::vector<std::string> &tokens) {
+std::string join_comma(const std::vector<std::string> &tokens) {
   std::string result;
   for (size_t i = 0; i < tokens.size(); ++i) {
     if (i != 0)
@@ -445,7 +453,7 @@ static std::string join_comma(const std::vector<std::string> &tokens) {
   return result;
 }
 
-static void maybe_expand_rocr_visible_devices(const rocjitsu::config::DbtGuestConfig &dbt_guest) {
+void maybe_expand_rocr_visible_devices(const rocjitsu::config::DbtGuestConfig &dbt_guest) {
   const char *visible = std::getenv("ROCR_VISIBLE_DEVICES");
   if (visible == nullptr || *visible == '\0')
     return;
@@ -497,7 +505,7 @@ static void maybe_expand_rocr_visible_devices(const rocjitsu::config::DbtGuestCo
   }
 }
 
-static void print_usage() {
+void print_usage() {
   std::cerr
       << "Usage: rocjitsu --config <config.json> [--daemon|--attach] -- <app> [args...]\n"
          "\n"

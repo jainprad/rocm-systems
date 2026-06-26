@@ -82,12 +82,9 @@ enum HookLogLevel : int {
 
 std::atomic<int> g_log_level{kLogDisabled};
 std::atomic<bool> g_signal_backtrace_enabled{false};
-
-constexpr uint32_t kHsaAmdAgentInfoDriverNodeId = 0xA004;
-constexpr hsa_amd_memory_pool_info_t kHsaAmdMemoryPoolInfoSegment = 0;
-constexpr hsa_amd_memory_pool_info_t kHsaAmdMemoryPoolInfoGlobalFlags = 1;
-constexpr hsa_amd_memory_pool_info_t kHsaAmdMemoryPoolInfoRuntimeAllocAllowed = 5;
-constexpr hsa_amd_memory_pool_info_t kHsaAmdMemoryPoolInfoLocation = 17;
+std::atomic<bool> g_signal_backtrace_installed{false};
+struct sigaction g_previous_sigsegv {};
+struct sigaction g_previous_sigabrt {};
 
 /// @brief Parsed ISA target used by DBT and HSA agent matching.
 struct TargetInfo {
@@ -147,18 +144,36 @@ struct HookConfig {
   return value;
 }
 
+/// @brief Chain to the signal handler that was installed before rocjitsu.
+void invoke_previous_signal_handler(int signo, siginfo_t *info, void *context) {
+  const struct sigaction &previous = signo == SIGABRT ? g_previous_sigabrt : g_previous_sigsegv;
+  if ((previous.sa_flags & SA_SIGINFO) != 0 && previous.sa_sigaction != nullptr) {
+    previous.sa_sigaction(signo, info, context);
+    return;
+  }
+  if (previous.sa_handler == SIG_IGN)
+    return;
+  if (previous.sa_handler != SIG_DFL && previous.sa_handler != nullptr) {
+    previous.sa_handler(signo);
+    return;
+  }
+  (void)::sigaction(signo, &previous, nullptr);
+  (void)::raise(signo);
+}
+
 /// @brief Print a best-effort stack trace for fatal hook signals.
-void signal_backtrace_handler(int signo) {
-  if (!g_signal_backtrace_enabled.exchange(false, std::memory_order_relaxed))
-    _exit(128 + signo);
+void signal_backtrace_handler(int signo, siginfo_t *info, void *context) {
+  if (!g_signal_backtrace_enabled.exchange(false, std::memory_order_relaxed)) {
+    invoke_previous_signal_handler(signo, info, context);
+    return;
+  }
 
   const char header[] = "\n[rocjitsu-hooks] signal backtrace\n";
   (void)::write(STDERR_FILENO, header, sizeof(header) - 1);
   void *frames[128];
   int count = ::backtrace(frames, 128);
   ::backtrace_symbols_fd(frames, count, STDERR_FILENO);
-  ::signal(signo, SIG_DFL);
-  ::raise(signo);
+  invoke_previous_signal_handler(signo, info, context);
 }
 
 /// @brief Install fatal-signal backtrace handling when enabled by config.
@@ -166,9 +181,33 @@ void maybe_install_signal_backtrace(bool enabled) {
   if (!enabled)
     return;
 
-  g_signal_backtrace_enabled.store(true, std::memory_order_relaxed);
-  ::signal(SIGSEGV, signal_backtrace_handler);
-  ::signal(SIGABRT, signal_backtrace_handler);
+  struct sigaction action {};
+  action.sa_sigaction = signal_backtrace_handler;
+  sigemptyset(&action.sa_mask);
+  action.sa_flags = SA_SIGINFO;
+
+  struct sigaction previous_sigsegv {};
+  struct sigaction previous_sigabrt {};
+  if (::sigaction(SIGSEGV, &action, &previous_sigsegv) != 0)
+    return;
+  if (::sigaction(SIGABRT, &action, &previous_sigabrt) != 0) {
+    (void)::sigaction(SIGSEGV, &previous_sigsegv, nullptr);
+    return;
+  }
+
+  g_previous_sigsegv = previous_sigsegv;
+  g_previous_sigabrt = previous_sigabrt;
+  g_signal_backtrace_installed.store(true, std::memory_order_release);
+  g_signal_backtrace_enabled.store(true, std::memory_order_release);
+}
+
+/// @brief Restore fatal-signal handlers installed before rocjitsu.
+void restore_signal_backtrace_handlers() {
+  g_signal_backtrace_enabled.store(false, std::memory_order_release);
+  if (!g_signal_backtrace_installed.exchange(false, std::memory_order_acq_rel))
+    return;
+  (void)::sigaction(SIGSEGV, &g_previous_sigsegv, nullptr);
+  (void)::sigaction(SIGABRT, &g_previous_sigabrt, nullptr);
 }
 
 /// @brief Load and validate DBT hook configuration from the runtime config file.
@@ -225,19 +264,6 @@ void log_message(int required_level, const char *format, ...) {
   va_end(args);
 
   util::Logger::dbt_hooks(message.data());
-}
-
-/// @brief Emit a hook trace message directly to stderr.
-void trace_message(int required_level, const char *format, ...) {
-  if (g_log_level.load(std::memory_order_relaxed) < required_level)
-    return;
-
-  std::fprintf(stderr, "[rocjitsu-hooks] ");
-  va_list args;
-  va_start(args, format);
-  std::vfprintf(stderr, format, args);
-  va_end(args);
-  std::fprintf(stderr, "\n");
 }
 
 /// @brief Return a compact architecture-family name for diagnostics.
@@ -858,20 +884,29 @@ public:
 
   /// @brief Restore rocjitsu wrappers if still installed and clear owned state.
   void uninstall() {
-    std::lock_guard lock(mutex_);
-    if (active_ && core_ != nullptr) {
-      trace_message(kLogVerbose, "uninstall begin");
+    bool had_state = false;
+    {
+      std::lock_guard lock(mutex_);
+      had_state = active_ || core_ != nullptr || amd_ext_ != nullptr;
+      if (active_ && core_ != nullptr) {
+        log_message(kLogVerbose, "uninstall begin");
 #define RJ_RESTORE_PATCH(name, table_ptr, present, patch_if_original, field, wrapper, type)        \
   if ((present) && (table_ptr)->field == wrapper)                                                  \
     (table_ptr)->field = original_##name##_;
-      RJ_HSA_PATCH_ENTRIES(RJ_RESTORE_PATCH)
+        RJ_HSA_PATCH_ENTRIES(RJ_RESTORE_PATCH)
 #undef RJ_RESTORE_PATCH
+      }
+      active_ = false;
     }
 
     CodeObjectReaderRegistry::instance().clear();
     ExecutableAgentRegistry::instance().clear();
     clear_memory_pool_mapper();
-    trace_message(kLogVerbose, "uninstall end");
+    if (!had_state)
+      return;
+
+    std::lock_guard lock(mutex_);
+    log_message(kLogVerbose, "uninstall end");
     clear_unlocked();
   }
 
@@ -927,7 +962,7 @@ private:
   void clear_unlocked() {
     active_ = false;
     g_log_level.store(kLogDisabled, std::memory_order_relaxed);
-    g_signal_backtrace_enabled.store(false, std::memory_order_relaxed);
+    restore_signal_backtrace_handlers();
     table_ = nullptr;
     core_ = nullptr;
     amd_ext_ = nullptr;
@@ -1165,7 +1200,7 @@ private:
 
     uint32_t node_id = 0;
     hsa_status_t status =
-        get_info(agent, static_cast<hsa_agent_info_t>(kHsaAmdAgentInfoDriverNodeId), &node_id);
+        get_info(agent, static_cast<hsa_agent_info_t>(HSA_AMD_AGENT_INFO_DRIVER_NODE_ID), &node_id);
     if (status != HSA_STATUS_SUCCESS)
       return std::nullopt;
     return node_id;
@@ -1291,23 +1326,24 @@ private:
 
   /// @brief Collected memory pools for one HSA agent.
   struct PoolList {
+    hsa_amd_memory_pool_get_info_fn_t get_info = nullptr;
     std::vector<PoolInfo> pools;
   };
 
   /// @brief Callback that records a pool and its matching attributes.
   static hsa_status_t collect_pool(hsa_amd_memory_pool_t pool, void *data) {
     auto *list = static_cast<PoolList *>(data);
-    auto *get_info = layer().amd_memory_pool_get_info();
-    if (list == nullptr || get_info == nullptr)
+    if (list == nullptr || list->get_info == nullptr)
       return HSA_STATUS_ERROR;
 
     PoolInfo info{};
     info.pool = pool;
-    if (get_info(pool, kHsaAmdMemoryPoolInfoSegment, &info.segment) != HSA_STATUS_SUCCESS)
+    if (list->get_info(pool, HSA_AMD_MEMORY_POOL_INFO_SEGMENT, &info.segment) != HSA_STATUS_SUCCESS)
       return HSA_STATUS_SUCCESS;
-    (void)get_info(pool, kHsaAmdMemoryPoolInfoGlobalFlags, &info.global_flags);
-    (void)get_info(pool, kHsaAmdMemoryPoolInfoRuntimeAllocAllowed, &info.runtime_alloc_allowed);
-    (void)get_info(pool, kHsaAmdMemoryPoolInfoLocation, &info.location);
+    (void)list->get_info(pool, HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS, &info.global_flags);
+    (void)list->get_info(pool, HSA_AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_ALLOWED,
+                         &info.runtime_alloc_allowed);
+    (void)list->get_info(pool, HSA_AMD_MEMORY_POOL_INFO_LOCATION, &info.location);
     list->pools.push_back(info);
     return HSA_STATUS_SUCCESS;
   }
@@ -1331,35 +1367,45 @@ private:
 
   /// @brief Lazily discover guest-to-host memory-pool mappings.
   void ensure_discovered() {
-    std::lock_guard lock(mutex_);
-    if (discovered_)
-      return;
-    discovered_ = true;
+    {
+      std::lock_guard lock(mutex_);
+      if (discovered_)
+        return;
+    }
 
     auto *iterate_pools = layer().amd_agent_iterate_memory_pools();
-    if (iterate_pools == nullptr)
-      return;
+    auto *get_info = layer().amd_memory_pool_get_info();
 
     hsa_agent_t guest = AgentMapper::instance().guest_agent();
     hsa_agent_t host = AgentMapper::instance().host_for_guest();
-    if (guest.handle == 0 || host.handle == 0)
-      return;
 
-    PoolList guest_pools;
-    PoolList host_pools;
-    hsa_status_t guest_status = iterate_pools(guest, collect_pool, &guest_pools);
-    hsa_status_t host_status = iterate_pools(host, collect_pool, &host_pools);
-    if (guest_status != HSA_STATUS_SUCCESS || host_status != HSA_STATUS_SUCCESS)
-      return;
+    std::unordered_map<uint64_t, uint64_t> discovered;
+    if (iterate_pools != nullptr && get_info != nullptr && guest.handle != 0 && host.handle != 0) {
+      PoolList guest_pools;
+      PoolList host_pools;
+      guest_pools.get_info = get_info;
+      host_pools.get_info = get_info;
+      hsa_status_t guest_status = iterate_pools(guest, collect_pool, &guest_pools);
+      hsa_status_t host_status = iterate_pools(host, collect_pool, &host_pools);
+      if (guest_status == HSA_STATUS_SUCCESS && host_status == HSA_STATUS_SUCCESS) {
+        for (const PoolInfo &guest_pool : guest_pools.pools) {
+          std::optional<PoolInfo> host_pool = find_match(guest_pool, host_pools.pools);
+          if (!host_pool)
+            continue;
+          discovered[guest_pool.pool.handle] = host_pool->pool.handle;
+          log_message(kLogDebug, "mapped guest pool=%llu to host pool=%llu",
+                      static_cast<unsigned long long>(guest_pool.pool.handle),
+                      static_cast<unsigned long long>(host_pool->pool.handle));
+        }
+      }
+    }
 
-    for (const PoolInfo &guest_pool : guest_pools.pools) {
-      std::optional<PoolInfo> host_pool = find_match(guest_pool, host_pools.pools);
-      if (!host_pool)
-        continue;
-      guest_to_host_[guest_pool.pool.handle] = host_pool->pool.handle;
-      trace_message(kLogDebug, "mapped guest pool=%llu to host pool=%llu",
-                    static_cast<unsigned long long>(guest_pool.pool.handle),
-                    static_cast<unsigned long long>(host_pool->pool.handle));
+    {
+      std::lock_guard lock(mutex_);
+      if (discovered_)
+        return;
+      guest_to_host_ = std::move(discovered);
+      discovered_ = true;
     }
   }
 
@@ -1413,15 +1459,15 @@ hsa_status_t HSA_API rj_code_object_reader_create_from_file(
 }
 
 hsa_status_t HSA_API rj_code_object_reader_destroy(hsa_code_object_reader_t code_object_reader) {
-  trace_message(kLogVerbose, "reader_destroy reader=%llu",
-                static_cast<unsigned long long>(code_object_reader.handle));
+  log_message(kLogVerbose, "reader_destroy reader=%llu",
+              static_cast<unsigned long long>(code_object_reader.handle));
   CodeObjectReaderRegistry::instance().remove(code_object_reader);
 
   auto *original = layer().destroy();
   if (original == nullptr)
     return HSA_STATUS_ERROR;
   hsa_status_t status = original(code_object_reader);
-  trace_message(kLogVerbose, "reader_destroy status=%d", static_cast<int>(status));
+  log_message(kLogVerbose, "reader_destroy status=%d", static_cast<int>(status));
   return status;
 }
 
@@ -1497,8 +1543,7 @@ hsa_status_t HSA_API rj_iterate_agents(hsa_status_t (*callback)(hsa_agent_t agen
     void *data = nullptr;
     hsa_agent_t guest{};
     hsa_agent_t host{};
-    bool guest_emitted = false;
-  } shadow{callback, data, guest, host, false};
+  } shadow{callback, data, guest, host};
 
   auto shadow_callback = [](hsa_agent_t agent, void *opaque) -> hsa_status_t {
     auto *shadow = static_cast<ShadowIteration *>(opaque);
@@ -1506,20 +1551,20 @@ hsa_status_t HSA_API rj_iterate_agents(hsa_status_t (*callback)(hsa_agent_t agen
       // Public enumeration is the replacement boundary: applications see the
       // guest agent in the selected host's ordinal slot, while ROCR keeps the
       // host agent alive for translated execution.
-      shadow->guest_emitted = true;
       return shadow->callback(shadow->guest, shadow->data);
     }
-    if (agent.handle == shadow->guest.handle && shadow->guest_emitted) {
-      // The synthetic KFD node is appended after the real GPUs. Skip that later
-      // duplicate so public clients see one GPU replacing the selected host.
+    if (agent.handle == shadow->guest.handle) {
+      // The synthetic KFD node may appear before or after the real host in
+      // ROCR enumeration. Always suppress its own slot so public clients see
+      // exactly one guest agent, emitted where the selected host appeared.
       return HSA_STATUS_SUCCESS;
     }
     return shadow->callback(agent, shadow->data);
   };
 
-  trace_message(kLogDebug, "iterate_agents shadow host=%llu guest=%llu",
-                static_cast<unsigned long long>(host.handle),
-                static_cast<unsigned long long>(guest.handle));
+  log_message(kLogDebug, "iterate_agents shadow host=%llu guest=%llu",
+              static_cast<unsigned long long>(host.handle),
+              static_cast<unsigned long long>(guest.handle));
   return original(shadow_callback, &shadow);
 }
 
@@ -1534,9 +1579,9 @@ hsa_status_t HSA_API rj_agent_iterate_isas(hsa_agent_t agent,
   // Keep the synthetic agent guest-facing so fatbin selection picks gfx950 code
   // objects; execution-facing hooks translate and map those loads to the host.
   hsa_agent_t mapped = AgentMapper::instance().map(agent);
-  trace_message(kLogDebug, "agent_iterate_isas agent=%llu mapped=%llu",
-                static_cast<unsigned long long>(agent.handle),
-                static_cast<unsigned long long>(mapped.handle));
+  log_message(kLogDebug, "agent_iterate_isas agent=%llu mapped=%llu",
+              static_cast<unsigned long long>(agent.handle),
+              static_cast<unsigned long long>(mapped.handle));
   return original(agent, callback, data);
 }
 
@@ -1548,9 +1593,9 @@ hsa_status_t HSA_API rj_queue_create(hsa_agent_t agent, uint32_t size, hsa_queue
   if (!original)
     return HSA_STATUS_ERROR;
   hsa_agent_t mapped = AgentMapper::instance().map(agent);
-  trace_message(kLogVerbose, "queue_create agent=%llu mapped=%llu size=%u",
-                static_cast<unsigned long long>(agent.handle),
-                static_cast<unsigned long long>(mapped.handle), size);
+  log_message(kLogVerbose, "queue_create agent=%llu mapped=%llu size=%u",
+              static_cast<unsigned long long>(agent.handle),
+              static_cast<unsigned long long>(mapped.handle), size);
   return original(mapped, size, type, callback, data, private_segment_size, group_segment_size,
                   queue);
 }
@@ -1559,10 +1604,10 @@ hsa_status_t HSA_API rj_queue_destroy(hsa_queue_t *queue) {
   auto *original = layer().queue_destroy();
   if (!original)
     return HSA_STATUS_ERROR;
-  trace_message(kLogVerbose, "queue_destroy queue=%p id=%llu", static_cast<void *>(queue),
-                queue ? static_cast<unsigned long long>(queue->id) : 0);
+  log_message(kLogVerbose, "queue_destroy queue=%p id=%llu", static_cast<void *>(queue),
+              queue ? static_cast<unsigned long long>(queue->id) : 0);
   hsa_status_t status = original(queue);
-  trace_message(kLogVerbose, "queue_destroy status=%d", static_cast<int>(status));
+  log_message(kLogVerbose, "queue_destroy status=%d", static_cast<int>(status));
   return status;
 }
 
@@ -1572,9 +1617,9 @@ hsa_status_t HSA_API rj_agent_iterate_regions(
   if (!original)
     return HSA_STATUS_ERROR;
   hsa_agent_t mapped = AgentMapper::instance().map(agent);
-  trace_message(kLogDebug, "agent_iterate_regions agent=%llu mapped=%llu",
-                static_cast<unsigned long long>(agent.handle),
-                static_cast<unsigned long long>(mapped.handle));
+  log_message(kLogDebug, "agent_iterate_regions agent=%llu mapped=%llu",
+              static_cast<unsigned long long>(agent.handle),
+              static_cast<unsigned long long>(mapped.handle));
   return original(mapped, callback, data);
 }
 
@@ -1584,20 +1629,19 @@ hsa_status_t HSA_API rj_memory_assign_agent(void *ptr, hsa_agent_t agent,
   if (!original)
     return HSA_STATUS_ERROR;
   hsa_agent_t mapped = AgentMapper::instance().map(agent);
-  trace_message(kLogVerbose, "memory_assign_agent ptr=%p agent=%llu mapped=%llu access=%d", ptr,
-                static_cast<unsigned long long>(agent.handle),
-                static_cast<unsigned long long>(mapped.handle), static_cast<int>(access));
+  log_message(kLogVerbose, "memory_assign_agent ptr=%p agent=%llu mapped=%llu access=%d", ptr,
+              static_cast<unsigned long long>(agent.handle),
+              static_cast<unsigned long long>(mapped.handle), static_cast<int>(access));
   return original(ptr, mapped, access);
 }
 
 hsa_status_t HSA_API rj_shut_down() {
   auto config = layer().config();
   if (config && config->guest_target) {
-    // ROCR teardown currently corrupts heap state after a synthetic guest agent
-    // has been initialized with host-backed resources. rocjitsu is a
-    // process-scoped launcher for this MVP, so let process exit reclaim ROCR.
-    trace_message(kLogVerbose, "skipping real hsa_shut_down in guest mode");
-    layer().uninstall();
+    // Guest mode does not call the real ROCR shutdown. Later language-runtime
+    // teardown can still run HSA cleanup paths, so keep rocjitsu's API-table
+    // mappings installed until process exit.
+    log_message(kLogVerbose, "skipping real hsa_shut_down in guest mode");
     return HSA_STATUS_SUCCESS;
   }
 
@@ -1608,14 +1652,14 @@ hsa_status_t HSA_API rj_shut_down() {
 }
 
 hsa_status_t HSA_API rj_executable_destroy(hsa_executable_t executable) {
-  trace_message(kLogVerbose, "executable_destroy exec=%llu",
-                static_cast<unsigned long long>(executable.handle));
+  log_message(kLogVerbose, "executable_destroy exec=%llu",
+              static_cast<unsigned long long>(executable.handle));
   ExecutableAgentRegistry::instance().erase_executable(executable);
   auto *original = layer().executable_destroy();
   if (!original)
     return HSA_STATUS_ERROR;
   hsa_status_t status = original(executable);
-  trace_message(kLogVerbose, "executable_destroy status=%d", static_cast<int>(status));
+  log_message(kLogVerbose, "executable_destroy status=%d", static_cast<int>(status));
   return status;
 }
 
@@ -1628,10 +1672,10 @@ hsa_status_t HSA_API rj_executable_get_symbol(hsa_executable_t executable, const
     return HSA_STATUS_ERROR;
   hsa_agent_t mapped = ExecutableAgentRegistry::instance().map_agent(executable, agent);
   mapped = AgentMapper::instance().map(mapped);
-  trace_message(kLogVerbose, "get_symbol exec=%llu agent=%llu mapped=%llu symbol=%s",
-                static_cast<unsigned long long>(executable.handle),
-                static_cast<unsigned long long>(agent.handle),
-                static_cast<unsigned long long>(mapped.handle), symbol_name ? symbol_name : "");
+  log_message(kLogVerbose, "get_symbol exec=%llu agent=%llu mapped=%llu symbol=%s",
+              static_cast<unsigned long long>(executable.handle),
+              static_cast<unsigned long long>(agent.handle),
+              static_cast<unsigned long long>(mapped.handle), symbol_name ? symbol_name : "");
   return original(executable, module_name, symbol_name, mapped, call_convention, symbol);
 }
 
@@ -1649,11 +1693,10 @@ hsa_status_t HSA_API rj_executable_get_symbol_by_name(hsa_executable_t executabl
     mapped_agent = AgentMapper::instance().map(mapped_agent);
     mapped_ptr = &mapped_agent;
   }
-  trace_message(kLogVerbose, "get_symbol_by_name exec=%llu agent=%llu mapped=%llu symbol=%s",
-                static_cast<unsigned long long>(executable.handle),
-                static_cast<unsigned long long>(agent ? agent->handle : 0),
-                static_cast<unsigned long long>(mapped_agent.handle),
-                symbol_name ? symbol_name : "");
+  log_message(kLogVerbose, "get_symbol_by_name exec=%llu agent=%llu mapped=%llu symbol=%s",
+              static_cast<unsigned long long>(executable.handle),
+              static_cast<unsigned long long>(agent ? agent->handle : 0),
+              static_cast<unsigned long long>(mapped_agent.handle), symbol_name ? symbol_name : "");
   return original(executable, symbol_name, mapped_ptr, symbol);
 }
 
@@ -1666,10 +1709,10 @@ hsa_status_t HSA_API rj_executable_agent_global_variable_define(hsa_executable_t
     return HSA_STATUS_ERROR;
   hsa_agent_t mapped = ExecutableAgentRegistry::instance().map_agent(executable, agent);
   mapped = AgentMapper::instance().map(mapped);
-  trace_message(kLogVerbose, "global_variable_define exec=%llu agent=%llu mapped=%llu name=%s",
-                static_cast<unsigned long long>(executable.handle),
-                static_cast<unsigned long long>(agent.handle),
-                static_cast<unsigned long long>(mapped.handle), variable_name ? variable_name : "");
+  log_message(kLogVerbose, "global_variable_define exec=%llu agent=%llu mapped=%llu name=%s",
+              static_cast<unsigned long long>(executable.handle),
+              static_cast<unsigned long long>(agent.handle),
+              static_cast<unsigned long long>(mapped.handle), variable_name ? variable_name : "");
   return original(executable, mapped, variable_name, address);
 }
 
@@ -1709,9 +1752,9 @@ hsa_status_t HSA_API rj_amd_agent_iterate_memory_pools(
   if (!original)
     return HSA_STATUS_ERROR;
   hsa_agent_t mapped = AgentMapper::instance().map(agent);
-  trace_message(kLogDebug, "amd_agent_iterate_memory_pools agent=%llu mapped=%llu",
-                static_cast<unsigned long long>(agent.handle),
-                static_cast<unsigned long long>(mapped.handle));
+  log_message(kLogDebug, "amd_agent_iterate_memory_pools agent=%llu mapped=%llu",
+              static_cast<unsigned long long>(agent.handle),
+              static_cast<unsigned long long>(mapped.handle));
   return original(AgentMapper::instance().is_guest(agent) ? agent : mapped, callback, data);
 }
 
@@ -1721,9 +1764,9 @@ hsa_status_t HSA_API rj_amd_memory_pool_get_info(hsa_amd_memory_pool_t memory_po
   auto *original = layer().amd_memory_pool_get_info();
   if (!original)
     return HSA_STATUS_ERROR;
-  trace_message(kLogDebug, "amd_memory_pool_get_info pool=%llu attr=%u",
-                static_cast<unsigned long long>(memory_pool.handle),
-                static_cast<unsigned>(attribute));
+  log_message(kLogDebug, "amd_memory_pool_get_info pool=%llu attr=%u",
+              static_cast<unsigned long long>(memory_pool.handle),
+              static_cast<unsigned>(attribute));
   return original(memory_pool, attribute, value);
 }
 
@@ -1733,12 +1776,12 @@ hsa_status_t HSA_API rj_amd_memory_pool_allocate(hsa_amd_memory_pool_t memory_po
   if (!original)
     return HSA_STATUS_ERROR;
   hsa_amd_memory_pool_t mapped_pool = MemoryPoolMapper::instance().map(memory_pool);
-  trace_message(kLogVerbose, "amd_memory_pool_allocate pool=%llu mapped=%llu size=%zu flags=0x%x",
-                static_cast<unsigned long long>(memory_pool.handle),
-                static_cast<unsigned long long>(mapped_pool.handle), size, flags);
+  log_message(kLogVerbose, "amd_memory_pool_allocate pool=%llu mapped=%llu size=%zu flags=0x%x",
+              static_cast<unsigned long long>(memory_pool.handle),
+              static_cast<unsigned long long>(mapped_pool.handle), size, flags);
   hsa_status_t status = original(mapped_pool, size, flags, ptr);
-  trace_message(kLogVerbose, "amd_memory_pool_allocate status=%d ptr=%p", static_cast<int>(status),
-                ptr ? *ptr : nullptr);
+  log_message(kLogVerbose, "amd_memory_pool_allocate status=%d ptr=%p", static_cast<int>(status),
+              ptr ? *ptr : nullptr);
   return status;
 }
 
@@ -1746,9 +1789,9 @@ hsa_status_t HSA_API rj_amd_memory_pool_free(void *ptr) {
   auto *original = layer().amd_memory_pool_free();
   if (!original)
     return HSA_STATUS_ERROR;
-  trace_message(kLogVerbose, "amd_memory_pool_free ptr=%p", ptr);
+  log_message(kLogVerbose, "amd_memory_pool_free ptr=%p", ptr);
   hsa_status_t status = original(ptr);
-  trace_message(kLogVerbose, "amd_memory_pool_free status=%d", static_cast<int>(status));
+  log_message(kLogVerbose, "amd_memory_pool_free status=%d", static_cast<int>(status));
   return status;
 }
 
@@ -1761,7 +1804,7 @@ hsa_status_t HSA_API rj_amd_agent_memory_pool_get_info(hsa_agent_t agent,
     return HSA_STATUS_ERROR;
   hsa_agent_t mapped = AgentMapper::instance().map(agent);
   hsa_amd_memory_pool_t mapped_pool = MemoryPoolMapper::instance().map(memory_pool);
-  trace_message(
+  log_message(
       kLogDebug,
       "amd_agent_memory_pool_get_info agent=%llu mapped=%llu pool=%llu mapped=%llu "
       "attr=%u",
@@ -1777,17 +1820,14 @@ hsa_status_t HSA_API rj_amd_agents_allow_access(uint32_t num_agents, const hsa_a
   if (!original)
     return HSA_STATUS_ERROR;
   auto mapped = map_access_agent_array(agents, num_agents, flags);
-  hsa_agent_t selected_host = AgentMapper::instance().host_for_guest();
-  const bool guest_all_agent_access = mapped.changed && selected_host.handle != 0 && num_agents > 1;
   const uint32_t forwarded_count =
       mapped.changed ? static_cast<uint32_t>(mapped.agents.size()) : num_agents;
   const hsa_agent_t *forwarded_agents = mapped.changed ? mapped.agents.data() : agents;
   const uint32_t *forwarded_flags = mapped.changed && flags ? mapped.flags.data() : flags;
-  trace_message(
-      kLogVerbose, "amd_agents_allow_access ptr=%p count=%u forwarded=%u mapped=%d guest_all=%d",
-      ptr, num_agents, forwarded_count, mapped.changed ? 1 : 0, guest_all_agent_access ? 1 : 0);
+  log_message(kLogVerbose, "amd_agents_allow_access ptr=%p count=%u forwarded=%u mapped=%d", ptr,
+              num_agents, forwarded_count, mapped.changed ? 1 : 0);
   hsa_status_t status = original(forwarded_count, forwarded_agents, forwarded_flags, ptr);
-  trace_message(kLogVerbose, "amd_agents_allow_access status=%d", static_cast<int>(status));
+  log_message(kLogVerbose, "amd_agents_allow_access status=%d", static_cast<int>(status));
   return status;
 }
 
@@ -1801,13 +1841,13 @@ hsa_status_t HSA_API rj_amd_memory_async_copy(void *dst, hsa_agent_t dst_agent, 
     return HSA_STATUS_ERROR;
   hsa_agent_t mapped_dst = AgentMapper::instance().map(dst_agent);
   hsa_agent_t mapped_src = AgentMapper::instance().map(src_agent);
-  trace_message(kLogVerbose,
-                "amd_memory_async_copy dst_agent=%llu mapped=%llu src_agent=%llu mapped=%llu "
-                "size=%zu",
-                static_cast<unsigned long long>(dst_agent.handle),
-                static_cast<unsigned long long>(mapped_dst.handle),
-                static_cast<unsigned long long>(src_agent.handle),
-                static_cast<unsigned long long>(mapped_src.handle), size);
+  log_message(kLogVerbose,
+              "amd_memory_async_copy dst_agent=%llu mapped=%llu src_agent=%llu mapped=%llu "
+              "size=%zu",
+              static_cast<unsigned long long>(dst_agent.handle),
+              static_cast<unsigned long long>(mapped_dst.handle),
+              static_cast<unsigned long long>(src_agent.handle),
+              static_cast<unsigned long long>(mapped_src.handle), size);
   return original(dst, mapped_dst, src, mapped_src, size, num_dep_signals, dep_signals,
                   completion_signal);
 }
@@ -1821,14 +1861,14 @@ hsa_status_t HSA_API rj_amd_memory_async_copy_on_engine(
     return HSA_STATUS_ERROR;
   hsa_agent_t mapped_dst = AgentMapper::instance().map(dst_agent);
   hsa_agent_t mapped_src = AgentMapper::instance().map(src_agent);
-  trace_message(kLogVerbose,
-                "amd_memory_async_copy_on_engine dst_agent=%llu mapped=%llu src_agent=%llu "
-                "mapped=%llu size=%zu engine=%u",
-                static_cast<unsigned long long>(dst_agent.handle),
-                static_cast<unsigned long long>(mapped_dst.handle),
-                static_cast<unsigned long long>(src_agent.handle),
-                static_cast<unsigned long long>(mapped_src.handle), size,
-                static_cast<unsigned>(engine_id));
+  log_message(kLogVerbose,
+              "amd_memory_async_copy_on_engine dst_agent=%llu mapped=%llu src_agent=%llu "
+              "mapped=%llu size=%zu engine=%u",
+              static_cast<unsigned long long>(dst_agent.handle),
+              static_cast<unsigned long long>(mapped_dst.handle),
+              static_cast<unsigned long long>(src_agent.handle),
+              static_cast<unsigned long long>(mapped_src.handle), size,
+              static_cast<unsigned>(engine_id));
   return original(dst, mapped_dst, src, mapped_src, size, num_dep_signals, dep_signals,
                   completion_signal, engine_id, force_copy_on_sdma);
 }
@@ -1842,9 +1882,9 @@ hsa_status_t HSA_API rj_amd_memory_async_copy_rect(
   if (!original)
     return HSA_STATUS_ERROR;
   hsa_agent_t mapped = AgentMapper::instance().map(copy_agent);
-  trace_message(kLogVerbose, "amd_memory_async_copy_rect agent=%llu mapped=%llu dir=%u",
-                static_cast<unsigned long long>(copy_agent.handle),
-                static_cast<unsigned long long>(mapped.handle), static_cast<unsigned>(dir));
+  log_message(kLogVerbose, "amd_memory_async_copy_rect agent=%llu mapped=%llu dir=%u",
+              static_cast<unsigned long long>(copy_agent.handle),
+              static_cast<unsigned long long>(mapped.handle), static_cast<unsigned>(dir));
   return original(dst, dst_offset, src, src_offset, range, mapped, dir, num_dep_signals,
                   dep_signals, completion_signal);
 }
@@ -1895,9 +1935,9 @@ hsa_status_t HSA_API rj_amd_memory_fill(void *ptr, uint32_t value, size_t count)
   auto *original = layer().amd_memory_fill();
   if (!original)
     return HSA_STATUS_ERROR;
-  trace_message(kLogVerbose, "amd_memory_fill ptr=%p value=0x%x count=%zu", ptr, value, count);
+  log_message(kLogVerbose, "amd_memory_fill ptr=%p value=0x%x count=%zu", ptr, value, count);
   hsa_status_t status = original(ptr, value, count);
-  trace_message(kLogVerbose, "amd_memory_fill status=%d", static_cast<int>(status));
+  log_message(kLogVerbose, "amd_memory_fill status=%d", static_cast<int>(status));
   return status;
 }
 
@@ -1907,7 +1947,7 @@ hsa_status_t HSA_API rj_amd_pointer_info(const void *ptr, hsa_amd_pointer_info_t
   auto *original = layer().amd_pointer_info();
   if (!original)
     return HSA_STATUS_ERROR;
-  trace_message(kLogVerbose, "amd_pointer_info ptr=%p", ptr);
+  log_message(kLogVerbose, "amd_pointer_info ptr=%p", ptr);
   hsa_status_t status = original(ptr, info, alloc, num_agents_accessible, accessible);
   if (status == HSA_STATUS_SUCCESS) {
     if (info != nullptr &&
@@ -1918,10 +1958,10 @@ hsa_status_t HSA_API rj_amd_pointer_info(const void *ptr, hsa_amd_pointer_info_t
         (*accessible)[i] = AgentMapper::instance().guest_for_host((*accessible)[i]);
     }
   }
-  trace_message(kLogVerbose, "amd_pointer_info status=%d owner=%llu accessible=%u",
-                static_cast<int>(status),
-                static_cast<unsigned long long>(info ? info->agentOwner.handle : 0),
-                num_agents_accessible ? *num_agents_accessible : 0);
+  log_message(kLogVerbose, "amd_pointer_info status=%d owner=%llu accessible=%u",
+              static_cast<int>(status),
+              static_cast<unsigned long long>(info ? info->agentOwner.handle : 0),
+              num_agents_accessible ? *num_agents_accessible : 0);
   return status;
 }
 
@@ -1933,9 +1973,9 @@ hsa_status_t HSA_API rj_amd_svm_prefetch_async(void *ptr, size_t size, hsa_agent
   if (!original)
     return HSA_STATUS_ERROR;
   hsa_agent_t mapped = AgentMapper::instance().map(agent);
-  trace_message(kLogVerbose, "amd_svm_prefetch_async ptr=%p size=%zu agent=%llu mapped=%llu", ptr,
-                size, static_cast<unsigned long long>(agent.handle),
-                static_cast<unsigned long long>(mapped.handle));
+  log_message(kLogVerbose, "amd_svm_prefetch_async ptr=%p size=%zu agent=%llu mapped=%llu", ptr,
+              size, static_cast<unsigned long long>(agent.handle),
+              static_cast<unsigned long long>(mapped.handle));
   return original(ptr, size, mapped, num_dep_signals, dep_signals, completion_signal);
 }
 
@@ -1951,7 +1991,7 @@ hsa_status_t HSA_API rj_amd_vmem_set_access(void *va, size_t size,
     for (auto &entry : mapped)
       entry.agent_handle = AgentMapper::instance().map(entry.agent_handle);
   }
-  trace_message(kLogVerbose, "amd_vmem_set_access va=%p size=%zu desc_cnt=%zu", va, size, desc_cnt);
+  log_message(kLogVerbose, "amd_vmem_set_access va=%p size=%zu desc_cnt=%zu", va, size, desc_cnt);
   return original(va, size, mapped.empty() ? desc : mapped.data(), desc_cnt);
 }
 
@@ -1961,9 +2001,9 @@ hsa_status_t HSA_API rj_amd_vmem_get_access(void *va, hsa_access_permission_t *p
   if (!original)
     return HSA_STATUS_ERROR;
   hsa_agent_t mapped = AgentMapper::instance().map(agent_handle);
-  trace_message(kLogVerbose, "amd_vmem_get_access va=%p agent=%llu mapped=%llu", va,
-                static_cast<unsigned long long>(agent_handle.handle),
-                static_cast<unsigned long long>(mapped.handle));
+  log_message(kLogVerbose, "amd_vmem_get_access va=%p agent=%llu mapped=%llu", va,
+              static_cast<unsigned long long>(agent_handle.handle),
+              static_cast<unsigned long long>(mapped.handle));
   return original(va, perms, mapped);
 }
 
@@ -1972,10 +2012,9 @@ hsa_status_t HSA_API rj_amd_agent_set_async_scratch_limit(hsa_agent_t agent, siz
   if (!original)
     return HSA_STATUS_ERROR;
   hsa_agent_t mapped = AgentMapper::instance().map(agent);
-  trace_message(kLogVerbose,
-                "amd_agent_set_async_scratch_limit agent=%llu mapped=%llu threshold=%zu",
-                static_cast<unsigned long long>(agent.handle),
-                static_cast<unsigned long long>(mapped.handle), threshold);
+  log_message(kLogVerbose, "amd_agent_set_async_scratch_limit agent=%llu mapped=%llu threshold=%zu",
+              static_cast<unsigned long long>(agent.handle),
+              static_cast<unsigned long long>(mapped.handle), threshold);
   return original(mapped, threshold);
 }
 
@@ -1991,8 +2030,8 @@ hsa_status_t HSA_API rj_amd_memory_async_batch_copy(const hsa_amd_memory_copy_op
   std::vector<hsa_amd_memory_copy_op_t> mapped(copy_ops, copy_ops + num_copy_ops);
   std::vector<std::vector<hsa_agent_t>> mapped_dst_lists;
   mapped_dst_lists.reserve(num_copy_ops);
-  trace_message(kLogVerbose, "amd_memory_async_batch_copy ops=%u deps=%u", num_copy_ops,
-                num_dep_signals);
+  log_message(kLogVerbose, "amd_memory_async_batch_copy ops=%u deps=%u", num_copy_ops,
+              num_dep_signals);
   for (uint32_t i = 0; i < num_copy_ops; ++i) {
     auto &op = mapped[i];
     op.src_agent = AgentMapper::instance().map(op.src_agent);
@@ -2015,10 +2054,10 @@ hsa_status_t HSA_API rj_amd_agent_preload(hsa_agent_t agent, uint64_t flags) {
   if (!original)
     return HSA_STATUS_ERROR;
   hsa_agent_t mapped = AgentMapper::instance().map(agent);
-  trace_message(kLogVerbose, "amd_agent_preload agent=%llu mapped=%llu flags=0x%llx",
-                static_cast<unsigned long long>(agent.handle),
-                static_cast<unsigned long long>(mapped.handle),
-                static_cast<unsigned long long>(flags));
+  log_message(kLogVerbose, "amd_agent_preload agent=%llu mapped=%llu flags=0x%llx",
+              static_cast<unsigned long long>(agent.handle),
+              static_cast<unsigned long long>(mapped.handle),
+              static_cast<unsigned long long>(flags));
   return original(mapped, flags);
 }
 
@@ -2068,15 +2107,15 @@ hsa_status_t HSA_API rj_executable_load_agent_code_object(
   }
 
   const bool guest_load = AgentMapper::instance().is_guest(agent);
-  trace_message(kLogVerbose, "load_agent_code_object exec=%llu agent=%llu guest=%d reader=%llu",
-                static_cast<unsigned long long>(executable.handle),
-                static_cast<unsigned long long>(agent.handle), guest_load ? 1 : 0,
-                static_cast<unsigned long long>(code_object_reader.handle));
+  log_message(kLogVerbose, "load_agent_code_object exec=%llu agent=%llu guest=%d reader=%llu",
+              static_cast<unsigned long long>(executable.handle),
+              static_cast<unsigned long long>(agent.handle), guest_load ? 1 : 0,
+              static_cast<unsigned long long>(code_object_reader.handle));
   if (config->guest_target && !guest_load) {
     hsa_status_t status =
         original_load(executable, agent, code_object_reader, options, loaded_code_object);
-    trace_message(kLogVerbose, "load_agent_code_object host/pass-through status=%d",
-                  static_cast<int>(status));
+    log_message(kLogVerbose, "load_agent_code_object host/pass-through status=%d",
+                static_cast<int>(status));
     return status;
   }
 
@@ -2113,8 +2152,8 @@ hsa_status_t HSA_API rj_executable_load_agent_code_object(
                 elf_mach_name(source_target.mach), arch_name(source_target.arch));
     hsa_status_t status =
         original_load(executable, load_agent, code_object_reader, options, loaded_code_object);
-    trace_message(kLogVerbose, "load_agent_code_object already-target status=%d",
-                  static_cast<int>(status));
+    log_message(kLogVerbose, "load_agent_code_object already-target status=%d",
+                static_cast<int>(status));
     if (status == HSA_STATUS_SUCCESS && guest_load)
       ExecutableAgentRegistry::instance().record(executable, agent, load_agent);
     return status;
@@ -2153,8 +2192,8 @@ hsa_status_t HSA_API rj_executable_load_agent_code_object(
   }
 
   status = original_load(executable, load_agent, translated_reader, options, loaded_code_object);
-  trace_message(kLogVerbose, "load_agent_code_object translated load_agent=%llu status=%d",
-                static_cast<unsigned long long>(load_agent.handle), static_cast<int>(status));
+  log_message(kLogVerbose, "load_agent_code_object translated load_agent=%llu status=%d",
+              static_cast<unsigned long long>(load_agent.handle), static_cast<int>(status));
   CodeObjectReaderRegistry::instance().remove(translated_reader);
   if (auto *original_destroy = layer().destroy(); original_destroy != nullptr)
     (void)original_destroy(translated_reader);
@@ -2192,8 +2231,11 @@ extern "C" RJ_HOOK_EXPORT bool OnLoad(HsaApiTable *table, uint64_t runtime_versi
   auto config = parse_config();
   if (!config)
     return false;
-  maybe_install_signal_backtrace(config->signal_backtrace);
-  return layer().install(table, std::move(*config));
+  const bool signal_backtrace = config->signal_backtrace;
+  if (!layer().install(table, std::move(*config)))
+    return false;
+  maybe_install_signal_backtrace(signal_backtrace);
+  return true;
 }
 
 /// @brief ROCR HSA tools unload entry point.

@@ -43,6 +43,9 @@ public:
   /// @brief Return the /dev/kfd fd represented by this driver.
   [[nodiscard]] virtual int fd() const = 0;
 
+  /// @brief Reset inherited child-process state after fork().
+  virtual void reset_after_fork() {}
+
   /// @brief Retain one duplicate open reference, if this driver tracks them.
   virtual void retain_local_open() {}
 

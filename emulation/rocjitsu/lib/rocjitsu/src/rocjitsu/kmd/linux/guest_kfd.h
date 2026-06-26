@@ -136,7 +136,7 @@ public:
   [[nodiscard]] std::string drm_path() const override { return {}; }
 
   /// @brief Detach inherited child-process state before destroying this copy.
-  void reset_after_fork();
+  void reset_after_fork() override;
 
 private:
   /// @brief Open real KFD, generate topology, and select the host GPU.
@@ -175,6 +175,9 @@ private:
   /// @brief Mirror map_memory rewrites for unmap requests.
   int unmap_memory_ioctl(void *arg) override;
 
+  /// @brief Shared guest-to-host device-id rewrite for map/unmap memory ioctls.
+  template <typename Args> int map_or_unmap_memory_ioctl(Args *args, unsigned long request);
+
   /// @brief Fail unsupported guest execution ioctls visibly.
   int reject_guest_execution_ioctl(unsigned long request, void *arg) const;
 
@@ -190,7 +193,8 @@ private:
   mutable std::mutex mutex_;
   std::atomic<int> real_kfd_fd_{-1};
   uint32_t host_gpu_id_ = 0;
-  uint64_t next_synthetic_handle_ = 1ULL << 63;
+  static constexpr uint64_t kSyntheticHandleBase = 1ULL << 63;
+  uint64_t next_synthetic_handle_ = kSyntheticHandleBase;
   std::unordered_set<uint64_t> synthetic_handles_;
   std::atomic<bool> ready_{false};
 };

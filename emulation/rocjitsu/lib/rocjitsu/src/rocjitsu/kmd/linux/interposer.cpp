@@ -141,7 +141,7 @@ __attribute__((constructor)) void rj_install_signal_handler() {
 /// @brief All mutable interposer state.
 class InterposerContext {
 public:
-  static inline std::atomic<bool> in_construction{false};
+  static inline thread_local bool in_construction = false;
   static rocjitsu::LibcPassthrough &real() { return rocjitsu::libc_passthrough(); }
   static InterposerContext &ctx;
 
@@ -156,6 +156,7 @@ public:
   /// be locked by threads that no longer exist. We reinitialize everything so
   /// the next open("/dev/kfd") creates a fresh connection.
   void reset_after_fork() {
+    active_driver_.store(nullptr, std::memory_order_release);
     rj_vm_ = nullptr;
     if (guest_driver_)
       guest_driver_->reset_after_fork();
@@ -173,17 +174,13 @@ public:
     in_construction = false;
   }
 
-  LinuxKfd *driver() {
-    if (guest_driver_)
-      return guest_driver_.get();
-    return rj_vm_ ? rj_vm_->vm->driver() : nullptr;
-  }
+  LinuxKfd *driver() { return active_driver_.load(std::memory_order_acquire); }
   int driver_fd() {
     auto *d = driver();
     return d ? d->fd() : -1;
   }
   bool initialized() const {
-    return rj_vm_ != nullptr || guest_driver_ != nullptr ||
+    return active_driver_.load(std::memory_order_acquire) != nullptr ||
            remote_.load(std::memory_order_acquire) != nullptr;
   }
 
@@ -218,7 +215,7 @@ public:
   /// @brief Add one open reference for a remote (daemon-mode) KFD fd.
   /// @details Each live remote KFD fd (the primary plus every dup) holds one
   /// reference; the RPC connection is torn down only when the last reference is
-  /// dropped. Mirrors SimulatedDriver's local open refcount for the daemon path.
+  /// dropped. Mirrors SimulatedKfd's local open refcount for the daemon path.
   void retain_remote_open() { remote_open_refs_.fetch_add(1, std::memory_order_acq_rel); }
 
   /// @brief Drop one remote open reference, tearing down the connection on the
@@ -238,7 +235,7 @@ public:
     RemoteDriver *active_remote = remote_.load(std::memory_order_acquire);
     if (active_remote && remote_kfd_fd_.load(std::memory_order_acquire) >= 0) {
       // Re-open of an already-connected daemon: each open holds one reference,
-      // mirroring SimulatedDriver::open() retaining the local process.
+      // mirroring SimulatedKfd::open() retaining the local process.
       retain_remote_open();
       return active_remote;
     }
@@ -296,7 +293,7 @@ public:
       return;
     // Each live KFD fd (primary + every dup) holds one open reference, so the
     // process/connection is torn down only when the last fd closes. Retain on
-    // whichever backend is active (local SimulatedDriver or remote daemon RPC).
+    // whichever backend is active (local SimulatedKfd or remote daemon RPC).
     if (auto *d = driver())
       d->retain_local_open();
     else if (is_remote_mode())
@@ -416,7 +413,7 @@ public:
 
   LinuxKfd *get_or_create() {
     std::lock_guard lock(init_mutex_);
-    if (!rj_vm_ && !guest_driver_) {
+    if (active_driver_.load(std::memory_order_acquire) == nullptr) {
       in_construction = true;
       std::optional<std::string> cfg_path = child_config_path();
       if (!cfg_path) {
@@ -428,9 +425,16 @@ public:
       try {
         auto dbt_guest = rocjitsu::config::load_dbt_guest_config_from_file(*cfg_path);
         if (dbt_guest.enabled) {
-          guest_driver_ = std::make_unique<GuestKfd>(std::move(dbt_guest));
+          auto guest_driver = std::make_unique<GuestKfd>(std::move(dbt_guest));
+          if (guest_driver->open() < 0) {
+            in_construction = false;
+            return nullptr;
+          }
+          auto *driver = guest_driver.get();
+          guest_driver_ = std::move(guest_driver);
+          active_driver_.store(driver, std::memory_order_release);
           in_construction = false;
-          return driver();
+          return driver;
         }
       } catch (const std::exception &e) {
         util::Logger::debug_print("rocjitsu: failed to load child config: ", e.what());
@@ -438,11 +442,14 @@ public:
         return nullptr;
       }
 
-      if (rj_vm_create(cfg_path->c_str(), RJ_VM_MODE_LOCAL, &rj_vm_) != ROCJITSU_STATUS_SUCCESS) {
+      rj_vm_t *created_vm = nullptr;
+      if (rj_vm_create(cfg_path->c_str(), RJ_VM_MODE_LOCAL, &created_vm) !=
+          ROCJITSU_STATUS_SUCCESS) {
         util::Logger::debug_print("rocjitsu: failed to create VM");
         in_construction = false;
         return nullptr;
       }
+      rj_vm_ = created_vm;
 
       // Set up execution plugins based on environment variables.
       if (rj_vm_->soc) {
@@ -483,6 +490,8 @@ public:
         rj_vm_->soc->set_plugin_group(pg);
       }
 
+      LinuxKfd *driver = rj_vm_->vm->driver();
+      active_driver_.store(driver, std::memory_order_release);
       std::thread([vm = rj_vm_]() { rj_vm_run(vm, nullptr); }).detach();
       in_construction = false;
     }
@@ -504,6 +513,7 @@ public:
 private:
   rj_vm_t *rj_vm_ = nullptr;
   std::unique_ptr<GuestKfd> guest_driver_;
+  std::atomic<LinuxKfd *> active_driver_{nullptr};
   /// @brief Active daemon-mode remote driver, or nullptr in local mode.
   /// @details Stored atomically so lock-free readers (`remote()`,
   /// `remote_lookup()`, `initialized()`, the AMDKFD ioctl fallback, the mmap
@@ -516,7 +526,7 @@ private:
   /// @brief Open-reference count for the remote (daemon-mode) KFD connection.
   /// @details The primary remote fd and every dup of it each hold one
   /// reference; the RPC connection is torn down only when the last reference is
-  /// released. Mirrors SimulatedDriver's local open refcount for daemon mode.
+  /// released. Mirrors SimulatedKfd's local open refcount for daemon mode.
   std::atomic<int> remote_open_refs_{0};
 
   std::mutex init_mutex_;

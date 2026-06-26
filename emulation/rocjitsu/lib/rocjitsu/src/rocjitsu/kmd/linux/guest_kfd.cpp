@@ -9,13 +9,13 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cerrno>
 #include <charconv>
 #include <cstdio>
 #include <dirent.h>
 #include <fcntl.h>
 #include <filesystem>
-#include <fstream>
 #include <optional>
 #include <sstream>
 #include <string_view>
@@ -42,15 +42,44 @@ struct LinuxDirent64 {
 };
 
 std::string read_text_file(const fs::path &path) {
-  std::ifstream in(path);
-  std::ostringstream out;
-  out << in.rdbuf();
-  return out.str();
+  const std::string raw_path = path.string();
+  int fd = static_cast<int>(syscall(SYS_openat, AT_FDCWD, raw_path.c_str(), O_RDONLY | O_CLOEXEC));
+  if (fd < 0)
+    return {};
+
+  std::string out;
+  std::array<char, 4096> buffer{};
+  for (;;) {
+    ssize_t n = static_cast<ssize_t>(syscall(SYS_read, fd, buffer.data(), buffer.size()));
+    if (n == 0)
+      break;
+    if (n < 0) {
+      syscall(SYS_close, fd);
+      return {};
+    }
+    out.append(buffer.data(), static_cast<size_t>(n));
+  }
+  syscall(SYS_close, fd);
+  return out;
 }
 
 void write_text_file(const fs::path &path, const std::string &text) {
-  std::ofstream out(path);
-  out << text;
+  const std::string raw_path = path.string();
+  int fd = static_cast<int>(syscall(SYS_openat, AT_FDCWD, raw_path.c_str(),
+                                    O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644));
+  if (fd < 0)
+    return;
+
+  const char *cursor = text.data();
+  size_t remaining = text.size();
+  while (remaining > 0) {
+    ssize_t written = static_cast<ssize_t>(syscall(SYS_write, fd, cursor, remaining));
+    if (written <= 0)
+      break;
+    cursor += written;
+    remaining -= static_cast<size_t>(written);
+  }
+  syscall(SYS_close, fd);
 }
 
 uint32_t read_u32_property(const fs::path &path, std::string_view key, uint32_t fallback) {
@@ -108,7 +137,7 @@ uint32_t count_numeric_dirs(const fs::path &dir) {
 }
 
 std::optional<uint32_t> read_u32_file(const fs::path &path) {
-  std::ifstream in(path);
+  std::istringstream in(read_text_file(path));
   uint32_t value = 0;
   if (!(in >> value))
     return std::nullopt;
@@ -164,9 +193,8 @@ std::string io_link_to_cpu(uint32_t node_from) {
   return link.str();
 }
 
-std::string io_link_from_cpu(uint32_t link_index, uint32_t node_to) {
+std::string io_link_from_cpu(uint32_t node_to) {
   std::ostringstream link;
-  (void)link_index;
   link << "type 2\n"
        << "version_major 0\n"
        << "version_minor 0\n"
@@ -391,7 +419,7 @@ bool TopologyOverlay::patch_topology_files() {
   write_text_file(nodes_dir / "0" / "gpu_id", "0\n");
   write_text_file(cpu_props,
                   set_property(read_text_file(cpu_props), "io_links_count", existing_links + 1));
-  write_text_file(new_cpu_link / "properties", io_link_from_cpu(existing_links, guest_node_id_));
+  write_text_file(new_cpu_link / "properties", io_link_from_cpu(guest_node_id_));
   write_text_file(guest_props, set_property(read_text_file(guest_props), "io_links_count", 1));
   write_text_file(guest_link, io_link_to_cpu(guest_node_id_));
   return true;
@@ -444,13 +472,13 @@ GuestKfd::~GuestKfd() {
 }
 
 void GuestKfd::reset_after_fork() {
+  ready_.store(false, std::memory_order_release);
   int kfd_fd = real_kfd_fd_.exchange(-1, std::memory_order_acq_rel);
   if (kfd_fd >= 0)
     libc_passthrough().close(kfd_fd);
   overlay_.release_after_fork();
   synthetic_handles_.clear();
-  next_synthetic_handle_ = 1ULL << 63;
-  ready_.store(false, std::memory_order_release);
+  next_synthetic_handle_ = kSyntheticHandleBase;
 }
 
 bool GuestKfd::ensure_real_kfd_locked() {
@@ -516,36 +544,36 @@ int GuestKfd::get_process_apertures_ioctl(void *arg) {
     return -1;
   }
 
-  kfd_ioctl_get_process_apertures_new_args count_args{};
-  if (forward_ioctl(AMDKFD_IOC_GET_PROCESS_APERTURES_NEW, &count_args) != 0)
-    return -1;
-  const uint32_t host_count = count_args.num_of_nodes;
-  const uint32_t total_count = host_count + 1;
-
   if (args->num_of_nodes == 0 || args->kfd_process_device_apertures_ptr == 0) {
-    args->num_of_nodes = total_count;
+    kfd_ioctl_get_process_apertures_new_args count_args{};
+    if (forward_ioctl(AMDKFD_IOC_GET_PROCESS_APERTURES_NEW, &count_args) != 0)
+      return -1;
+    args->num_of_nodes = count_args.num_of_nodes + 1;
     return 0;
   }
 
   auto *out = reinterpret_cast<kfd_process_device_apertures *>(
       static_cast<uintptr_t>(args->kfd_process_device_apertures_ptr));
   const uint32_t requested = args->num_of_nodes;
-  std::vector<kfd_process_device_apertures> host(host_count);
+  std::vector<kfd_process_device_apertures> host(requested);
   if (!host.empty()) {
     kfd_ioctl_get_process_apertures_new_args host_args{};
     host_args.kfd_process_device_apertures_ptr =
         reinterpret_cast<uint64_t>(reinterpret_cast<uintptr_t>(host.data()));
-    host_args.num_of_nodes = host_count;
+    host_args.num_of_nodes = requested;
     if (forward_ioctl(AMDKFD_IOC_GET_PROCESS_APERTURES_NEW, &host_args) != 0)
       return -1;
+    const uint32_t host_to_copy = std::min(requested, host_args.num_of_nodes);
+    for (uint32_t i = 0; i < host_to_copy; ++i)
+      out[i] = host[i];
+    if (requested > host_to_copy) {
+      out[host_to_copy] = guest_apertures();
+      args->num_of_nodes = host_to_copy + 1;
+    } else {
+      args->num_of_nodes = host_to_copy;
+    }
+    return 0;
   }
-
-  const uint32_t host_to_copy = std::min(requested, host_count);
-  for (uint32_t i = 0; i < host_to_copy; ++i)
-    out[i] = host[i];
-  if (requested > host_count)
-    out[host_count] = guest_apertures();
-  args->num_of_nodes = std::min(requested, total_count);
   return 0;
 }
 
@@ -602,8 +630,12 @@ int GuestKfd::alloc_memory_ioctl(void *arg) {
     errno = EINVAL;
     return -1;
   }
-  if (args->gpu_id != guest_.gpu_id)
-    return forward_ioctl(AMDKFD_IOC_ALLOC_MEMORY_OF_GPU, arg);
+  if (args->gpu_id != guest_.gpu_id) {
+    int ret = forward_ioctl(AMDKFD_IOC_ALLOC_MEMORY_OF_GPU, arg);
+    if (ret == 0)
+      assert(args->handle < kSyntheticHandleBase);
+    return ret;
+  }
 
   std::lock_guard lock(mutex_);
   args->handle = next_synthetic_handle_++;
@@ -622,11 +654,12 @@ int GuestKfd::free_memory_ioctl(void *arg) {
     if (synthetic_handles_.erase(args->handle) != 0)
       return 0;
   }
+  assert(args->handle < kSyntheticHandleBase);
   return forward_ioctl(AMDKFD_IOC_FREE_MEMORY_OF_GPU, arg);
 }
 
-int GuestKfd::map_memory_ioctl(void *arg) {
-  auto *args = static_cast<kfd_ioctl_map_memory_to_gpu_args *>(arg);
+template <typename Args>
+int GuestKfd::map_or_unmap_memory_ioctl(Args *args, unsigned long request) {
   if (!args) {
     errno = EINVAL;
     return -1;
@@ -644,8 +677,10 @@ int GuestKfd::map_memory_ioctl(void *arg) {
 
   auto *ids =
       reinterpret_cast<const uint32_t *>(static_cast<uintptr_t>(args->device_ids_array_ptr));
-  if (!ids)
-    return forward_ioctl(AMDKFD_IOC_MAP_MEMORY_TO_GPU, arg);
+  if (!ids) {
+    assert(args->handle < kSyntheticHandleBase);
+    return forward_ioctl(request, args);
+  }
 
   std::vector<uint32_t> host_ids;
   host_ids.reserve(args->n_devices);
@@ -658,73 +693,35 @@ int GuestKfd::map_memory_ioctl(void *arg) {
       append_unique_gpu_id(&host_ids, ids[i]);
     }
   }
-  if (!has_guest)
-    return forward_ioctl(AMDKFD_IOC_MAP_MEMORY_TO_GPU, arg);
+  if (!has_guest) {
+    assert(args->handle < kSyntheticHandleBase);
+    return forward_ioctl(request, args);
+  }
   if (host_ids.empty()) {
     args->n_success = args->n_devices;
     return 0;
   }
 
+  assert(args->handle < kSyntheticHandleBase);
   auto host_args = *args;
   host_args.device_ids_array_ptr =
       reinterpret_cast<uint64_t>(reinterpret_cast<uintptr_t>(host_ids.data()));
   host_args.n_devices = static_cast<uint32_t>(host_ids.size());
   host_args.n_success = 0;
-  if (forward_ioctl(AMDKFD_IOC_MAP_MEMORY_TO_GPU, &host_args) != 0)
+  if (forward_ioctl(request, &host_args) != 0)
     return -1;
   args->n_success = args->n_devices;
   return 0;
 }
 
+int GuestKfd::map_memory_ioctl(void *arg) {
+  return map_or_unmap_memory_ioctl(static_cast<kfd_ioctl_map_memory_to_gpu_args *>(arg),
+                                   AMDKFD_IOC_MAP_MEMORY_TO_GPU);
+}
+
 int GuestKfd::unmap_memory_ioctl(void *arg) {
-  auto *args = static_cast<kfd_ioctl_unmap_memory_from_gpu_args *>(arg);
-  if (!args) {
-    errno = EINVAL;
-    return -1;
-  }
-
-  uint32_t host_gpu_id = 0;
-  {
-    std::lock_guard lock(mutex_);
-    host_gpu_id = host_gpu_id_;
-    if (synthetic_handles_.count(args->handle) != 0) {
-      args->n_success = args->n_devices;
-      return 0;
-    }
-  }
-
-  auto *ids =
-      reinterpret_cast<const uint32_t *>(static_cast<uintptr_t>(args->device_ids_array_ptr));
-  if (!ids)
-    return forward_ioctl(AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU, arg);
-
-  std::vector<uint32_t> host_ids;
-  host_ids.reserve(args->n_devices);
-  bool has_guest = false;
-  for (uint32_t i = 0; i < args->n_devices; ++i) {
-    if (ids[i] == guest_.gpu_id) {
-      has_guest = true;
-      append_unique_gpu_id(&host_ids, host_gpu_id);
-    } else {
-      append_unique_gpu_id(&host_ids, ids[i]);
-    }
-  }
-  if (!has_guest)
-    return forward_ioctl(AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU, arg);
-  if (host_ids.empty()) {
-    args->n_success = args->n_devices;
-    return 0;
-  }
-
-  auto host_args = *args;
-  host_args.device_ids_array_ptr =
-      reinterpret_cast<uint64_t>(reinterpret_cast<uintptr_t>(host_ids.data()));
-  host_args.n_devices = static_cast<uint32_t>(host_ids.size());
-  host_args.n_success = 0;
-  if (forward_ioctl(AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU, &host_args) != 0)
-    return -1;
-  args->n_success = args->n_devices;
-  return 0;
+  return map_or_unmap_memory_ioctl(static_cast<kfd_ioctl_unmap_memory_from_gpu_args *>(arg),
+                                   AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU);
 }
 
 int GuestKfd::ioctl(unsigned long request, void *arg) {

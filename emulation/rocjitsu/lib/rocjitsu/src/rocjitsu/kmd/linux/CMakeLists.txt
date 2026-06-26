@@ -12,6 +12,7 @@ rj_add_object_library(rocjitsu_kmd
     transport.cpp
 )
 target_include_directories(rocjitsu_kmd PRIVATE ${GENERATED_DIR})
+target_link_libraries(rocjitsu_kmd PUBLIC ${CMAKE_DL_LIBS})
 
 add_library(rocjitsu_kmd_shim SHARED interposer.cpp)
 target_include_directories(

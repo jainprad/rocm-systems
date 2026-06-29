@@ -487,75 +487,23 @@ bool GraphExec::DeviceHonorsSameQueueAnyOrder(int dev_id) {
 }
 
 // ================================================================================================
-// Clear the AQL barrier bit on segments that oversubscribe a queue, so capable
-// hardware overlaps the colliding kernels instead of serializing them. Multi-
-// queue scheduling is untouched: when parallelism fits the pool every head is
-// the first on its queue and keeps barrier=1. Single idempotent forward pass;
-// the bit is written explicitly per head packet so re-running after a node
-// update reproduces the same result.
-void GraphExec::ApplySameQueueOverlapPolicy() {
+// Stamp Approach B's precomputed head-barrier decision onto a single segment's
+// head dispatch packet. The decision (seg.clear_head_barrier) is made once in
+// PrecomputeStreamAssignment() in dispatch order; here we just write the bit on
+// the first real dispatch packet (skipping any prepended cross-queue barriers).
+// The bit is written explicitly (set or clear) so re-stamping after a node
+// update re-captures the head with barrier=1 reproduces the same result.
+// No-op unless oversubscription overlap + capable HW enabled it in Init().
+void GraphExec::SetSegmentHeadBarrier(const Segment& seg, SegmentBatch& sb) {
   if (!anyorder_enabled_) {
     return;
   }
-
-  // First dispatch packet of a segment, skipping any prepended sync packets.
-  auto headDispatch = [](SegmentBatch& sb) -> uint8_t* {
-    for (auto& batch : sb.packet_batches) {
-      for (uint8_t* pkt : batch.dispatchPackets) {
-        if (packetIsDispatch(pkt)) {
-          return pkt;
-        }
+  for (auto& batch : sb.packet_batches) {
+    for (uint8_t* pkt : batch.dispatchPackets) {
+      if (packetIsDispatch(pkt)) {
+        writeDispatchBarrierBit(pkt, !seg.clear_head_barrier);
+        return;
       }
-    }
-    return nullptr;
-  };
-
-  // A segment whose head depends on work on a *different* queue is gated by a
-  // prepended BARRIER_AND / embedded dep_signal; its head must keep barrier=1.
-  auto dependsOffQueue = [&](const Segment& seg) {
-    for (int dep : seg.segment_ids_dependencies) {
-      if (dep >= 0 && dep < static_cast<int>(segments_.size())) {
-        const Segment& prev = segments_[dep];
-        if (prev.dev_id != seg.dev_id || prev.stream_id != seg.stream_id) {
-          return true;
-        }
-      }
-    }
-    return false;
-  };
-
-  for (int level = 0; level <= max_dependency_level_; ++level) {
-    auto lit = segments_per_level_.find(level);
-    if (lit == segments_per_level_.end()) {
-      continue;
-    }
-
-    // Track the first segment that lands on each (device, stream) at this level.
-    // Only later collisions on the same queue (oversubscription) get cleared.
-    std::unordered_set<uint64_t> occupiedQueues;
-
-    for (int seg_id : lit->second) {
-      if (seg_id < 0 || seg_id >= static_cast<int>(segments_.size())) {
-        continue;
-      }
-      auto sbIt = segmentBatches_.find(seg_id);
-      if (sbIt == segmentBatches_.end()) {
-        continue;
-      }
-      uint8_t* head = headDispatch(sbIt->second);
-      if (head == nullptr) {
-        continue;
-      }
-
-      const Segment& seg = segments_[seg_id];
-      const uint64_t queueKey =
-          (static_cast<uint64_t>(static_cast<uint32_t>(seg.dev_id)) << 32) |
-          static_cast<uint32_t>(seg.stream_id);
-      const bool isFirstOnQueue = occupiedQueues.insert(queueKey).second;
-
-      // Keep the barrier on the queue's first occupant and on any cross-queue
-      // entry; clear it only on later same-queue collisions so they overlap.
-      writeDispatchBarrierBit(head, isFirstOnQueue || dependsOffQueue(seg));
     }
   }
 }
@@ -705,6 +653,11 @@ void GraphExec::BuildSyncPlan() {
     if (segment.segment_ids_edges.empty()) {
       sync_plan_.leaf_segment_ids.push_back(segment.id);
     }
+
+    // Approach B: stamp the precomputed head-barrier decision now that any
+    // cross-queue barriers have been prepended above (head-find skips those).
+    // No-op unless same-queue overlap is enabled.
+    SetSegmentHeadBarrier(segment, segBatch);
   }
 
   // Create the per-graph HW event signal pool once at instantiate time
@@ -1298,10 +1251,44 @@ void GraphExec::PrecomputeStreamAssignment() {
     // the same device spread evenly across that device's stream pool.
     std::unordered_map<int, size_t> dev_idx;
 
+    // Approach B: track the first segment to land on each (device, stream) at
+    // this level. Iteration order here is the dispatch order (same vector drives
+    // EnqueueSegmentedGraph), so "first on queue" is genuinely enqueued first --
+    // its kept barrier=1 fences all prior-level work on that queue.
+    std::unordered_set<uint64_t> occupiedQueues;
+
     for (int seg_id : it->second) {
       if (seg_id >= 0 && seg_id < static_cast<int>(segments_.size())) {
         auto& seg = segments_[seg_id];
         seg.stream_id = static_cast<int>(dev_idx[seg.dev_id]++ % getPoolSize(seg.dev_id));
+
+        // Decide whether this head may drop its AQL barrier bit for same-queue
+        // overlap. Deps are always at a strictly lower level (topological sort)
+        // and lower levels are assigned first, so dep stream_ids are final here.
+        seg.clear_head_barrier = false;
+        if (anyorder_enabled_) {
+          const uint64_t queueKey =
+              (static_cast<uint64_t>(static_cast<uint32_t>(seg.dev_id)) << 32) |
+              static_cast<uint32_t>(seg.stream_id);
+          const bool isFirstOnQueue = occupiedQueues.insert(queueKey).second;
+
+          // A head with a cross-queue dependency is gated by a prepended
+          // BARRIER_AND / embedded dep_signal and must keep barrier=1.
+          bool dependsOffQueue = false;
+          for (int dep : seg.segment_ids_dependencies) {
+            if (dep >= 0 && dep < static_cast<int>(segments_.size())) {
+              const Segment& prev = segments_[dep];
+              if (prev.dev_id != seg.dev_id || prev.stream_id != seg.stream_id) {
+                dependsOffQueue = true;
+                break;
+              }
+            }
+          }
+
+          // Clear only on a later same-queue collision whose deps are all on
+          // this same queue; first-on-queue and cross-queue heads keep barrier=1.
+          seg.clear_head_barrier = !isFirstOnQueue && !dependsOffQueue;
+        }
       }
     }
   }
@@ -1697,13 +1684,10 @@ hipError_t GraphExec::CaptureAndFormPacketsForGraph() {
   }
 
   // Build sync plan now that all segment batches are populated --
-  // prepends barrier packets and generates the patch list
+  // prepends barrier packets, stamps Approach B head-barrier bits, and
+  // generates the patch list. Running before the flat buffers are built below
+  // means rebuildFlatBuffer() snapshots the adjusted headers.
   BuildSyncPlan();
-
-  // Adjust barrier bits for same-queue overlap before the flat buffers are
-  // built below, so rebuildFlatBuffer() snapshots the adjusted headers. No-op
-  // unless oversubscription overlap + capable HW enabled it in Init().
-  ApplySameQueueOverlapPolicy();
 
   // Build flat buffers once now that all dispatchPackets are finalized
   // (capture populated them, BuildSyncPlan may have prepended/appended barriers).
@@ -1880,11 +1864,12 @@ hipError_t GraphExec::UpdateAQLPacket(hip::GraphNode* node) {
           }
         }
       }
-      // Re-derive the same-queue overlap barrier bits before rebuilding: the
+      // Re-stamp the same-queue overlap barrier bit before rebuilding: the
       // update re-captured this node's packets with the default barrier=1
-      // header. The pass is idempotent for unchanged segments (it rewrites the
-      // same bit value), so only this batch needs a rebuild below.
-      ApplySameQueueOverlapPolicy();
+      // header. The decision (clear_head_barrier) was fixed at instantiate and
+      // exec-update cannot change topology or stream assignment, so re-applying
+      // it to just this segment's head is sufficient.
+      SetSegmentHeadBarrier(segments_[segmentId], segBatch);
 
       // Rebuild the flat buffer immediately so the next dispatch uses updated packets.
       // The flat buffer always represents the full packet sequence; the dispatch path

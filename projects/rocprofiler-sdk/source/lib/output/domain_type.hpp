@@ -39,7 +39,6 @@ enum class domain_type
     PC_SAMPLING_HOST_TRAP,
     ROCDECODE,
     ROCJPEG,
-    ROCSHMEM,
     PC_SAMPLING_STOCHASTIC,
     KFD,
     SPM_COUNTER_COLLECTION,

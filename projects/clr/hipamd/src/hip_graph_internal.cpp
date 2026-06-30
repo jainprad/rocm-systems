@@ -333,9 +333,25 @@ hipError_t Graph::ScheduleNodesIntoBatches() {
 
   // Check if this is a complex graph that would benefit from classic path
   // Complex graphs: 16+ segments with average segment length < 8
+  //
+  // Exception: when same-queue any-order overlap (Approach B) is enabled AND the
+  // device honors it (gfx12.5+), a wide-shallow graph (many short parallel
+  // segments) is precisely the shape the optimization targets -- those segments
+  // oversubscribe the queue pool and overlap on capable HW. The complex-graph
+  // heuristic would otherwise disable segment scheduling here, taking the
+  // any-order path with it, so skip the fallback in that case. Both conditions
+  // are required: the flag is opt-in/default-off, and on ISAs that do not honor
+  // any-order it buys nothing, so we must keep the classic fallback there to
+  // avoid a regression. Init() runs after this (ScheduleNodes precedes Init), so
+  // instantiateDeviceId_ is not set yet -- use the current device, which is the
+  // instantiation device.
+  const bool anyorderApplies =
+      DEBUG_HIP_GRAPH_ANYORDER_OVERLAP &&
+      GraphExec::DeviceHonorsSameQueueAnyOrder(hip::getCurrentDevice()->deviceId());
   const size_t kSegmentSizeThreshold = 16;
   const double kAvgSegmentLengthThreshold = 8.0;
-  if (segments_.size() >= kSegmentSizeThreshold && DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING != 2) {
+  if (segments_.size() >= kSegmentSizeThreshold && DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING != 2 &&
+      !anyorderApplies) {
     size_t total_nodes = 0;
     for (const auto& segment : segments_) {
       total_nodes += segment.nodes.size();

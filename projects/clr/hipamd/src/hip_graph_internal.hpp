@@ -1224,8 +1224,11 @@ class GraphExec : public amd::ReferenceCountedObject, public Graph {
   // Stamp the precomputed head-barrier decision onto one segment's head dispatch
   // packet (idempotent; re-applied per segment after a node update re-capture).
   void SetSegmentHeadBarrier(const Segment& seg, SegmentBatch& sb);
+
+ public:
   // True for ISAs whose CP honors out-of-order same-queue dispatch when the
-  // barrier bit is clear (gfx1250 / gfx12.5+).
+  // barrier bit is clear (gfx1250 / gfx12.5+). Public so Graph::ScheduleNodes-
+  // IntoBatches() can gate the complex-graph fallback on capable HW.
   static bool DeviceHonorsSameQueueAnyOrder(int dev_id);
 };
 

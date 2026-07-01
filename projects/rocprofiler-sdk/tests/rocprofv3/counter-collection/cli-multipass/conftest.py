@@ -86,3 +86,27 @@ def pass2_counter_data(output_dir):
         for row in reader:
             data.append(row)
     return data
+
+
+@pytest.fixture
+def pass3_agent_info(output_dir):
+    """Agent info from pass 3"""
+    filename = os.path.join(output_dir, "pass_3", "out_agent_info.csv")
+    data = []
+    with open(filename, "r") as inp:
+        reader = csv.DictReader(inp)
+        for row in reader:
+            data.append(row)
+    return data
+
+
+@pytest.fixture
+def pass3_counter_data(output_dir):
+    """Counter data from pass 3"""
+    filename = os.path.join(output_dir, "pass_3", "out_counter_collection.csv")
+    data = []
+    with open(filename, "r") as inp:
+        reader = csv.DictReader(inp)
+        for row in reader:
+            data.append(row)
+    return data

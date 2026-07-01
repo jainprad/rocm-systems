@@ -398,6 +398,116 @@ HIP_TEST_CASE(Unit_hipLaunchHostFunc_CrossStreamDep_UncapturedFirstNode) {
   HIP_CHECK(hipHostFree(h_flag));
 }
 
+
+/**
+ * Test Description
+ * ------------------------
+ *    - Regression test: an uncaptured host node that immediately follows a
+ *      captured DtoH packet batch in the same graph segment must see host
+ *      memory written by that captured batch.
+ *
+ *      Graph (direct API, single path / same stream):
+ *
+ *        K_prod -> DtoH(d_flag -> h_flag) -> host_node(reads h_flag) -> DtoH sanity
+ *
+ *      The host node has a single dependency, so it remains on the same
+ *      graph segment and stream. This covers the same-stream path that the
+ *      cross-stream host-first-consumer test does not exercise.
+ *
+ * Test source
+ * ------------------------
+ *    - catch/unit/graph/hipLaunchHostFuncWithGraph.cc
+ * Test requirements
+ * ------------------------
+ *    - HIP_VERSION >= 5.3
+ */
+HIP_TEST_CASE(Unit_hipLaunchHostFunc_SameStreamCapturedDtoH_UncapturedHost) {
+  int ticks_per_ms = 0;
+#if HT_NVIDIA
+  HIP_CHECK(hipDeviceGetAttribute(&ticks_per_ms, hipDeviceAttributeClockRate, 0));
+#else
+  HIP_CHECK(hipDeviceGetAttribute(&ticks_per_ms, hipDeviceAttributeWallClockRate, 0));
+#endif
+  if (ticks_per_ms == 0) {
+    ticks_per_ms = 1000;
+  }
+  const long long kSpin = static_cast<long long>(ticks_per_ms) * 50;  // ~50 ms
+  constexpr int kExpected = 1;
+
+  int* h_flag{};
+  int* h_cb_saw{};
+  int* h_out{};
+  HIP_CHECK(hipHostMalloc(&h_flag, sizeof(int), hipHostMallocDefault));
+  HIP_CHECK(hipHostMalloc(&h_cb_saw, sizeof(int), hipHostMallocDefault));
+  HIP_CHECK(hipHostMalloc(&h_out, sizeof(int), hipHostMallocDefault));
+
+  int* d_flag{};
+  HIP_CHECK(hipMalloc(&d_flag, sizeof(int)));
+
+  hipGraph_t graph{};
+  HIP_CHECK(hipGraphCreate(&graph, 0));
+
+  hipGraphNode_t prod_node{};
+  {
+    long long spin = kSpin;
+    void* args[] = {&d_flag, &spin};
+    hipKernelNodeParams p{};
+    p.func = reinterpret_cast<void*>(spin_then_set);
+    p.gridDim = dim3(1);
+    p.blockDim = dim3(1);
+    p.kernelParams = args;
+    HIP_CHECK(hipGraphAddKernelNode(&prod_node, graph, nullptr, 0, &p));
+  }
+
+  hipGraphNode_t dtoh_flag_node{};
+  HIP_CHECK(hipGraphAddMemcpyNode1D(&dtoh_flag_node, graph, &prod_node, 1,
+                                    h_flag, d_flag, sizeof(int), hipMemcpyDeviceToHost));
+
+  struct CbArgs {
+    int* h_flag;
+    int* h_cb_saw;
+  };
+  CbArgs cb_args{h_flag, h_cb_saw};
+  hipGraphNode_t host_node{};
+  hipHostNodeParams host_params{};
+  host_params.fn = [](void* ud) {
+    auto* a = static_cast<CbArgs*>(ud);
+    *a->h_cb_saw = *a->h_flag;
+  };
+  host_params.userData = &cb_args;
+  HIP_CHECK(hipGraphAddHostNode(&host_node, graph, &dtoh_flag_node, 1, &host_params));
+
+  hipGraphNode_t check_node{};
+  HIP_CHECK(hipGraphAddMemcpyNode1D(&check_node, graph, &host_node, 1,
+                                    h_out, d_flag, sizeof(int), hipMemcpyDeviceToHost));
+
+  hipGraphExec_t graphExec{};
+  HIP_CHECK(hipGraphInstantiate(&graphExec, graph, nullptr, nullptr, 0));
+  hipStream_t launch_stream{};
+  HIP_CHECK(hipStreamCreate(&launch_stream));
+
+  for (int iter = 0; iter < 10; ++iter) {
+    *h_flag = 0;
+    *h_cb_saw = 0;
+    *h_out = 0;
+    HIP_CHECK(hipMemset(d_flag, 0, sizeof(int)));
+    HIP_CHECK(hipGraphLaunch(graphExec, launch_stream));
+    HIP_CHECK(hipStreamSynchronize(launch_stream));
+
+    INFO("iter=" << iter << " h_cb_saw=" << *h_cb_saw << " h_out=" << *h_out);
+    REQUIRE(*h_cb_saw == kExpected);
+    REQUIRE(*h_out == kExpected);
+  }
+
+  HIP_CHECK(hipGraphExecDestroy(graphExec));
+  HIP_CHECK(hipGraphDestroy(graph));
+  HIP_CHECK(hipStreamDestroy(launch_stream));
+  HIP_CHECK(hipFree(d_flag));
+  HIP_CHECK(hipHostFree(h_out));
+  HIP_CHECK(hipHostFree(h_cb_saw));
+  HIP_CHECK(hipHostFree(h_flag));
+}
+
 /**
  * End doxygen group GraphTest.
  * @}

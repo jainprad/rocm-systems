@@ -2320,6 +2320,24 @@ hipError_t GraphExec::EnqueueSegment(const Segment& segment, hip::Stream* stream
 
   size_t batchIndex = 0;
 
+  // A downstream segment can begin with an uncaptured host node whose callback
+  // reads host memory produced by this segment's captured AQL batch.  When this
+  // segment reaches its tail batch, publish those GPU writes with system scope
+  // before the host callback is allowed to run.
+  const bool host_first_consumer = [&]() -> bool {
+    for (int edge_id : segment.segment_ids_edges) {
+      if (edge_id < 0 || edge_id >= static_cast<int>(segments_.size())) {
+        continue;
+      }
+      const auto& consumer = segments_[edge_id];
+      if (consumer.first_node != nullptr &&
+          consumer.first_node->GetType() == hipGraphNodeTypeHost) {
+        return true;
+      }
+    }
+    return false;
+  }();
+
   // Lambda to dispatch the current batch at batchIndex.
   // attach_signal=true asks the dispatcher to give the last packet a real
   // completion signal (via Barriers().ActiveSignal) so a downstream
@@ -2448,22 +2466,33 @@ hipError_t GraphExec::EnqueueSegment(const Segment& segment, hip::Stream* stream
         }
         // Skip all consecutive captured nodes that belong to this batch
         i += packetBatch.nodeRanges.size() - 1;
-        // Check if the next uncaptured node is an SDMA memcpy that needs handoff.
-        // Only set sdma_follows if that's the case and the node will use SDMA.
-        // Otherwise, staging-blit or other paths do not need the signal.
+        // Check whether the captured batch hands data to an uncaptured consumer.
+        // SDMA memcpy consumers need an attached signal for engine ordering.
+        // Host-node consumers need system-scope release on the producer batch so
+        // their CPU callback can observe host-memory writes made by captured
+        // kernels or D2H blits.
         bool sdma_follows = false;
+        bool host_follows = false;
         size_t next = i + 1;
         if (next < segment.nodes.size() &&
             next < segBatch->node_capture_status.size() &&
-            !segBatch->node_capture_status[next] &&
-            segment.nodes[next]->GetType() == hipGraphNodeTypeMemcpy) {
-          auto* memcpyNode = dynamic_cast<GraphMemcpyNode*>(segment.nodes[next]);
-          // Memcpy node types that don't derive from GraphMemcpyNode
-          // (e.g. GraphDrvMemcpyNode) fall back to the conservative
-          // "assume SDMA" behavior.
-          sdma_follows = (memcpyNode == nullptr) || !memcpyNode->WillBypassSdmaEngine();
+            !segBatch->node_capture_status[next]) {
+          const auto next_type = segment.nodes[next]->GetType();
+          host_follows = (next_type == hipGraphNodeTypeHost);
+          if (next_type == hipGraphNodeTypeMemcpy) {
+            auto* memcpyNode = dynamic_cast<GraphMemcpyNode*>(segment.nodes[next]);
+            // Memcpy node types that don't derive from GraphMemcpyNode
+            // (e.g. GraphDrvMemcpyNode) fall back to the conservative
+            // "assume SDMA" behavior.
+            sdma_follows = (memcpyNode == nullptr) || !memcpyNode->WillBypassSdmaEngine();
+          }
         }
-        if (sdma_follows && !packetBatch.dispatchPackets.empty()) {
+        // Cover both host-node layouts: the host node can immediately follow in
+        // the same segment, or it can be the first node of a downstream segment
+        // after this segment's tail batch.
+        bool host_consumer_needs_scope = host_follows ||
+            (host_first_consumer && next >= segment.nodes.size());
+        if ((sdma_follows || host_consumer_needs_scope) && !packetBatch.dispatchPackets.empty()) {
           stream->vdev()->addSystemScope();
         }
         status = dispatchCurrentBatch(sdma_follows);

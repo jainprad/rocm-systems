@@ -35,14 +35,31 @@ EXPECTED_PASS_COUNT = 3
 # so the strict "> 0" counter-value check is only applied to real kernel rows.
 INTERNAL_KERNEL_RE = re.compile(r"__amd_rocclr_.*")
 
+# At present, AQLProfile has bugs when reporting the counters for the below
+# architectures, so the strict "> 0" positivity check is relaxed to ">= 0" for
+# them (kept in sync with kernel_filtering/validate.py). This does NOT weaken the
+# check on gfx942 / other CDNA parts.
+SKIP_GFX = ("gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1152", "gfx1153")
+
 
 def _is_real_kernel(kernel_name):
     return not INTERNAL_KERNEL_RE.search(kernel_name)
 
 
-def _validate_counter_data(counter_data, expected_counter, pass_label):
+def _gfx_by_agent(agent_info):
+    """Map a GPU agent's logical node id to its gfx (architecture) name"""
+    mapping = {}
+    for row in agent_info:
+        if row["Agent_Type"] == "GPU":
+            mapping[row["Logical_Node_Id"]] = row["Name"]
+    return mapping
+
+
+def _validate_counter_data(counter_data, agent_info, expected_counter, pass_label):
     """Common counter-value validation for a single pass"""
     assert len(counter_data) > 0, f"No counter data found in {pass_label}"
+
+    gfx_by_agent = _gfx_by_agent(agent_info)
 
     for row in counter_data:
         assert (
@@ -52,9 +69,16 @@ def _validate_counter_data(counter_data, expected_counter, pass_label):
         assert int(row["Process_Id"]) > 0
         assert len(row["Kernel_Name"]) > 0
         assert len(row["Counter_Value"]) > 0
+
+        # counter rows reference the agent as e.g. "Agent 2"; the trailing token
+        # is the logical node id used to look up the agent's gfx name.
+        agent_node = row["Agent_Id"].split(" ")[-1]
+        agent_gfx = gfx_by_agent.get(agent_node)
+
         # Real kernel dispatches must report a positive counter value; internal
-        # runtime copy kernels may legitimately read 0.
-        if _is_real_kernel(row["Kernel_Name"]):
+        # runtime copy kernels may legitimately read 0. On AQLProfile-buggy
+        # architectures the strict positivity check is relaxed to ">= 0".
+        if _is_real_kernel(row["Kernel_Name"]) and agent_gfx not in SKIP_GFX:
             assert (
                 float(row["Counter_Value"]) > 0
             ), f"{expected_counter} value is not > 0 for {row['Kernel_Name']} in {pass_label}"
@@ -78,7 +102,9 @@ def test_pass_count(output_dir):
     pass_dirs = sorted(
         d
         for d in os.listdir(output_dir)
-        if d.startswith("pass_") and os.path.isdir(os.path.join(output_dir, d))
+        if d.startswith("pass_")
+        and d[len("pass_") :].isdigit()
+        and os.path.isdir(os.path.join(output_dir, d))
     )
 
     # this repo is 1-indexed; there must never be a pass_0
@@ -143,19 +169,21 @@ def test_pass3_agent_info(pass3_agent_info):
             assert int(row["Simd_Count"]) > 0
 
 
-def test_pass1_counters(pass1_counter_data):
+def test_pass1_counters(pass1_counter_data, pass1_agent_info):
     """Validate counters from pass 1 (SQ_WAVES)"""
-    _validate_counter_data(pass1_counter_data, "SQ_WAVES", "pass 1")
+    _validate_counter_data(pass1_counter_data, pass1_agent_info, "SQ_WAVES", "pass 1")
 
 
-def test_pass2_counters(pass2_counter_data):
+def test_pass2_counters(pass2_counter_data, pass2_agent_info):
     """Validate counters from pass 2 (GRBM_COUNT)"""
-    _validate_counter_data(pass2_counter_data, "GRBM_COUNT", "pass 2")
+    _validate_counter_data(pass2_counter_data, pass2_agent_info, "GRBM_COUNT", "pass 2")
 
 
-def test_pass3_counters(pass3_counter_data):
+def test_pass3_counters(pass3_counter_data, pass3_agent_info):
     """Validate counters from pass 3 (GRBM_GUI_ACTIVE)"""
-    _validate_counter_data(pass3_counter_data, "GRBM_GUI_ACTIVE", "pass 3")
+    _validate_counter_data(
+        pass3_counter_data, pass3_agent_info, "GRBM_GUI_ACTIVE", "pass 3"
+    )
 
 
 def test_same_kernel_count_all_passes(

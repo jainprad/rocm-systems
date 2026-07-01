@@ -76,6 +76,35 @@ rocprofiler_add_integration_validate_test(
     LABELS "integration-tests"
     FIXTURES_REQUIRED rocprofv3-test-counter-collection-kernel-filtering-input-cmd)
 
+# iteration-range on the command line (combined with --kernel-include-regex)
+rocprofiler_add_integration_execute_test(
+    rocprofv3-test-counter-collection-kernel-filtering-input-cmd-iteration-range
+    COMMAND
+        $<TARGET_FILE:rocprofiler-sdk::rocprofv3> -i ${CMAKE_CURRENT_BINARY_DIR}/input.txt
+        --kernel-include-regex ".*_kernel" --kernel-iteration-range "[1-2]" -T -d
+        ${CMAKE_CURRENT_BINARY_DIR}/cmd_iteration_range_input -o out --output-format csv
+        -- $<TARGET_FILE:vector-ops> 4 1
+    DEPENDS vector-ops
+    TIMEOUT 120
+    LABELS "integration-tests"
+    PRELOAD "${PRELOAD_ENV}"
+    FIXTURES_SETUP
+        rocprofv3-test-counter-collection-kernel-filtering-input-cmd-iteration-range)
+
+rocprofiler_add_integration_validate_test(
+    rocprofv3-test-counter-collection-kernel-filtering-input-cmd-iteration-range
+    TEST_PATHS validate.py
+    COPY conftest.py input.txt input.json input.yml
+    CONFIG pytest.ini
+    DISCOVERY_ARGS -k test_validate_counter_collection_csv_iteration_range
+    ARGS --input-csv-iteration-range
+         ${CMAKE_CURRENT_BINARY_DIR}/cmd_iteration_range_input/pmc_1/out_counter_collection.csv
+         --kernel-iteration-range "[1-2]"
+    TIMEOUT 120
+    LABELS "integration-tests"
+    FIXTURES_REQUIRED
+        rocprofv3-test-counter-collection-kernel-filtering-input-cmd-iteration-range)
+
 rocprofiler_add_integration_execute_test(
     rocprofv3-test-counter-collection-kernel-filtering-input-yaml
     COMMAND

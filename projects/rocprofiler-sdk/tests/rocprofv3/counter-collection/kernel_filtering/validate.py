@@ -64,6 +64,31 @@ def validate_csv(df, kernel_list, counter_name):
     assert (df["Counter_Value"].astype(int).values > 0).all()
 
 
+def validate_csv_iteration_range(df, kernel_list, counter_name, iteration_range):
+
+    # Reuse the standard kernel-name / counter checks and the per-kernel
+    # equal-count invariant.
+    validate_csv(df, kernel_list, counter_name)
+
+    # Additionally assert that the number of captured dispatches per kernel
+    # equals the size of the requested --kernel-iteration-range, i.e. that the
+    # iteration-range filter selected exactly the requested launch indices and
+    # not every launch of each kernel.
+    expected_count = len(iteration_range)
+    assert expected_count > 0
+
+    kernel_count = dict([[itr, 0] for itr in kernel_list])
+    for itr in df["Kernel_Name"]:
+        if re.search(r"__amd_rocclr_.*", itr):
+            continue
+        kernel_count[itr] += 1
+
+    for kernel_name, count in kernel_count.items():
+        assert (
+            count == expected_count
+        ), f"{kernel_name} captured {count} dispatches, expected {expected_count}"
+
+
 def validate_json(json_data, counter_name, check_dispatch):
 
     data = json_data["rocprofiler-sdk-tool"]
@@ -131,6 +156,17 @@ def test_validate_counter_collection_csv_pass1(input_csv_pass1: pd.DataFrame):
 def test_validate_counter_collection_csv_pmc1(input_csv_pmc1: pd.DataFrame):
     kernel_list = sorted(["addition_kernel", "subtract_kernel", "divide_kernel"])
     validate_csv(input_csv_pmc1, kernel_list, "SQ_WAVES")
+
+
+def test_validate_counter_collection_csv_iteration_range(
+    input_csv_iteration_range: pd.DataFrame, iteration_range
+):
+    kernel_list = sorted(
+        ["addition_kernel", "subtract_kernel", "multiply_kernel", "divide_kernel"]
+    )
+    validate_csv_iteration_range(
+        input_csv_iteration_range, kernel_list, "SQ_WAVES", iteration_range
+    )
 
 
 def test_validate_counter_collection_csv_pass2(input_csv_pass2: pd.DataFrame):

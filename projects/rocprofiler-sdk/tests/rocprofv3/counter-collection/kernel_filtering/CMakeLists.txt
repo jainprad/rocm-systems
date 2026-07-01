@@ -76,14 +76,21 @@ rocprofiler_add_integration_validate_test(
     LABELS "integration-tests"
     FIXTURES_REQUIRED rocprofv3-test-counter-collection-kernel-filtering-input-cmd)
 
-# iteration-range on the command line (combined with --kernel-include-regex)
+# iteration-range on the command line (combined with --kernel-include-regex). Defined once
+# so the rocprofv3 CLI argument and the validator argument cannot drift.
+set(_ITER_RANGE "[1-2]")
+
+# --kernel-trace is enabled so the JSON results contain the full (unfiltered)
+# kernel_dispatch buffer records, allowing the validator to recover each captured
+# dispatch's per-kernel launch ordinal and prove the exact requested iterations were
+# selected.
 rocprofiler_add_integration_execute_test(
     rocprofv3-test-counter-collection-kernel-filtering-input-cmd-iteration-range
     COMMAND
         $<TARGET_FILE:rocprofiler-sdk::rocprofv3> -i ${CMAKE_CURRENT_BINARY_DIR}/input.txt
-        --kernel-include-regex ".*_kernel" --kernel-iteration-range "[1-2]" -T -d
-        ${CMAKE_CURRENT_BINARY_DIR}/cmd_iteration_range_input -o out --output-format csv
-        -- $<TARGET_FILE:vector-ops> 4 1
+        --kernel-include-regex ".*_kernel" --kernel-iteration-range "${_ITER_RANGE}"
+        --kernel-trace -T -d ${CMAKE_CURRENT_BINARY_DIR}/cmd_iteration_range_input -o out
+        --output-format csv json -- $<TARGET_FILE:vector-ops> 3 1
     DEPENDS vector-ops
     TIMEOUT 120
     LABELS "integration-tests"
@@ -96,10 +103,13 @@ rocprofiler_add_integration_validate_test(
     TEST_PATHS validate.py
     COPY conftest.py input.txt input.json input.yml
     CONFIG pytest.ini
-    DISCOVERY_ARGS -k test_validate_counter_collection_csv_iteration_range
+    DISCOVERY_ARGS -k iteration_range
     ARGS --input-csv-iteration-range
          ${CMAKE_CURRENT_BINARY_DIR}/cmd_iteration_range_input/pmc_1/out_counter_collection.csv
-         --kernel-iteration-range "[1-2]"
+         --input-json-iteration-range
+         ${CMAKE_CURRENT_BINARY_DIR}/cmd_iteration_range_input/pmc_1/out_results.json
+         --kernel-iteration-range
+         "${_ITER_RANGE}"
     TIMEOUT 120
     LABELS "integration-tests"
     FIXTURES_REQUIRED

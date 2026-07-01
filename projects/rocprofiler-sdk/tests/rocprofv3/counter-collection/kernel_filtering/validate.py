@@ -89,6 +89,71 @@ def validate_csv_iteration_range(df, kernel_list, counter_name, iteration_range)
         ), f"{kernel_name} captured {count} dispatches, expected {expected_count}"
 
 
+def validate_json_iteration_range(json_data, kernel_list, iteration_range):
+
+    # Prove that the EXACT requested launch indices were captured (not merely
+    # the right count). --kernel-trace is enabled for this test, so
+    # buffer_records.kernel_dispatch contains every launch of every kernel
+    # (the dispatch trace is not affected by --kernel-iteration-range), whereas
+    # callback_records.counter_collection only contains the SELECTED dispatches.
+    # We recover each kernel's per-name launch ordinal from the full trace and
+    # assert the selected ordinals equal the requested range set.
+    data = json_data["rocprofiler-sdk-tool"]
+    counter_collection_data = data["callback_records"]["counter_collection"]
+    kernel_dispatch_data = data["buffer_records"]["kernel_dispatch"]
+
+    def get_kernel_name(kernel_id):
+        return data["kernel_symbols"][kernel_id]["formatted_kernel_name"]
+
+    # Walk the full (unfiltered) dispatch trace in order and assign each
+    # dispatch_id its 1-based ordinal within its own kernel name.
+    per_kernel_seen = dict([[itr, 0] for itr in kernel_list])
+    ordinal_by_dispatch_id = {}
+    kernel_by_dispatch_id = {}
+    for dispatch in kernel_dispatch_data:
+        dispatch_info = dispatch["dispatch_info"]
+        kernel_name = get_kernel_name(dispatch_info["kernel_id"])
+        if kernel_name not in per_kernel_seen:
+            continue
+        per_kernel_seen[kernel_name] += 1
+        dispatch_id = dispatch_info["dispatch_id"]
+        ordinal_by_dispatch_id[dispatch_id] = per_kernel_seen[kernel_name]
+        kernel_by_dispatch_id[dispatch_id] = kernel_name
+
+    # The dispatch trace must contain strictly MORE launches per kernel than the
+    # size of the requested range; otherwise we could not distinguish the
+    # original launch ordinals from a trace that had itself been filtered down
+    # to the range. vector-ops launches each kernel once per stream (3 streams
+    # in this test), so with a 2-element range every targeted kernel is launched
+    # 3 > 2 times. This assertion is what makes the "exact iteration" proof
+    # sound: it confirms --kernel-iteration-range filters only the
+    # counter_collection callback records, not the kernel_dispatch trace, which
+    # is the same convention the sibling range_filtering test relies on.
+    expected_ordinals = set(iteration_range)
+    for kernel_name in kernel_list:
+        assert per_kernel_seen[kernel_name] > len(expected_ordinals), (
+            f"{kernel_name} launched {per_kernel_seen[kernel_name]} times; "
+            f"expected more than the {len(expected_ordinals)} requested "
+            "iterations so original launch ordinals can be recovered"
+        )
+
+    # Collect the per-kernel ordinals that were actually counter-collected.
+    captured_ordinals = dict([[itr, set()] for itr in kernel_list])
+    for counter in counter_collection_data:
+        dispatch_info = counter["dispatch_data"]["dispatch_info"]
+        dispatch_id = dispatch_info["dispatch_id"]
+        kernel_name = kernel_by_dispatch_id.get(dispatch_id)
+        if kernel_name is None:
+            continue
+        captured_ordinals[kernel_name].add(ordinal_by_dispatch_id[dispatch_id])
+
+    for kernel_name in kernel_list:
+        assert captured_ordinals[kernel_name] == expected_ordinals, (
+            f"{kernel_name} captured iterations {sorted(captured_ordinals[kernel_name])}, "
+            f"expected {sorted(expected_ordinals)}"
+        )
+
+
 def validate_json(json_data, counter_name, check_dispatch):
 
     data = json_data["rocprofiler-sdk-tool"]
@@ -166,6 +231,17 @@ def test_validate_counter_collection_csv_iteration_range(
     )
     validate_csv_iteration_range(
         input_csv_iteration_range, kernel_list, "SQ_WAVES", iteration_range
+    )
+
+
+def test_validate_counter_collection_json_iteration_range(
+    input_json_iteration_range, iteration_range
+):
+    kernel_list = sorted(
+        ["addition_kernel", "subtract_kernel", "multiply_kernel", "divide_kernel"]
+    )
+    validate_json_iteration_range(
+        input_json_iteration_range, kernel_list, iteration_range
     )
 
 

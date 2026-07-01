@@ -93,6 +93,12 @@ def pytest_addoption(parser):
     )
 
     parser.addoption(
+        "--input-json-iteration-range",
+        action="store",
+        help="Path to JSON file.",
+    )
+
+    parser.addoption(
         "--kernel-iteration-range",
         action="store",
         help="Kernel iteration range passed on the command line.",
@@ -155,6 +161,13 @@ def input_csv_iteration_range(request):
     filename = request.config.getoption("--input-csv-iteration-range")
     with open(filename, "r") as inp:
         return pd.read_csv(inp)
+
+
+@pytest.fixture
+def input_json_iteration_range(request):
+    filename = request.config.getoption("--input-json-iteration-range")
+    with open(filename, "r") as inp:
+        return dotdict(collapse_dict_list(json.load(inp)))
 
 
 @pytest.fixture

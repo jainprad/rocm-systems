@@ -490,7 +490,7 @@ HIP_TEST_CASE(Unit_hipLaunchHostFunc_SameStreamCapturedDtoH_UncapturedHost) {
     *h_flag = 0;
     *h_cb_saw = 0;
     *h_out = 0;
-    HIP_CHECK(hipMemset(d_flag, 0, sizeof(int)));
+    HIP_CHECK(hipMemsetAsync(d_flag, 0, sizeof(int), launch_stream));
     HIP_CHECK(hipGraphLaunch(graphExec, launch_stream));
     HIP_CHECK(hipStreamSynchronize(launch_stream));
 

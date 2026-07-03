@@ -441,6 +441,14 @@ add_test(
         tests/test_profile_general.py ${WORKING_DIR_OPTION}
 )
 
+add_test(
+    NAME test_profile_triton_trace
+    COMMAND
+        ${PYTHON_TEST_COMMAND} -m pytest ${STANDALONEBINARY_TEST_OPTION} -m triton_trace
+        --junitxml=tests/test_profile_triton_trace.xml ${COV_OPTION}
+        tests/test_profile_general.py ${WORKING_DIR_OPTION}
+)
+
 set_tests_properties(
     test_profile_kernel_execution
     test_profile_dispatch
@@ -456,6 +464,7 @@ set_tests_properties(
     test_profile_iteration_multiplexing_2
     test_profile_iteration_multiplexing_stochastic
     test_profile_torch_trace
+    test_profile_triton_trace
     PROPERTIES LABELS "profile" RESOURCE_GROUPS gpus:1 TIMEOUT 1800
 )
 
@@ -794,6 +803,13 @@ if(TARGET test-rocprofiler-compute-tool)
         set(_tool_test_cmd $<TARGET_FILE:test-rocprofiler-compute-tool>)
     endif()
     add_test(NAME test-rocprofiler-compute-tool COMMAND ${_tool_test_cmd})
+    sanitizer_runtime_env(_san_env OFF)
+    if(_san_env)
+        set_tests_properties(
+            test-rocprofiler-compute-tool
+            PROPERTIES ENVIRONMENT "${_san_env}"
+        )
+    endif()
 endif()
 
 if(TARGET test-pc-sampling-collector)
@@ -803,6 +819,13 @@ if(TARGET test-pc-sampling-collector)
         set(_pcs_test_cmd $<TARGET_FILE:test-pc-sampling-collector>)
     endif()
     add_test(NAME test-pc-sampling-collector COMMAND ${_pcs_test_cmd})
+    sanitizer_runtime_env(_san_env OFF)
+    if(_san_env)
+        set_tests_properties(
+            test-pc-sampling-collector
+            PROPERTIES ENVIRONMENT "${_san_env}"
+        )
+    endif()
 endif()
 
 # -----------------------------------
@@ -842,6 +865,7 @@ if(${ENABLE_COVERAGE})
         test_torch_trace_analysis
         test_torch_trace_coverage
         test_profile_torch_trace
+        test_profile_triton_trace
         test_torch_cpp_loader
         test_inject_roctx_package
     )

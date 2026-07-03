@@ -468,6 +468,31 @@ class Runtime {
 
   Agent* agent_by_gpuid(uint32_t gpuid) { return agents_by_gpuid_[gpuid]; }
 
+  Agent* agent_by_nodeid(uint32_t node_id) {
+    auto it = agents_by_node_.find(node_id);
+    return (it != agents_by_node_.end() && !it->second.empty()) ? it->second[0] : nullptr;
+  }
+
+  /// @brief Select the driver bound to a representative GPU agent.
+  ///
+  /// Returns the driver managing the GPU node @p node_hint, or, when no hint is
+  /// given (or the hint is not a GPU node), the driver of the first GPU agent.
+  /// This routes device operations to whichever backend (KFD or DRM) owns the
+  /// GPU transparently. In the KFD-only case every agent shares the same
+  /// KfdDriver instance, so the selected driver is byte-for-byte identical.
+  Driver& AgentDriver(uint32_t node_hint = INVALID_NODEID) {
+    if (node_hint != INVALID_NODEID) {
+      Agent* agent = agent_by_nodeid(node_hint);
+      if (agent && agent->device_type() == Agent::kAmdGpuDevice) return agent->driver();
+    }
+
+    if (gpu_agents_.empty())
+      throw AMD::hsa_exception(HSA_STATUS_ERROR_INVALID_AGENT,
+                               "No GPU agent available to service SVM request.");
+
+    return gpu_agents_[0]->driver();
+  }
+
   Agent* region_gpu() { return region_gpu_; }
 
   const std::vector<std::shared_ptr<const MemoryRegion>>& system_regions_fine() const {

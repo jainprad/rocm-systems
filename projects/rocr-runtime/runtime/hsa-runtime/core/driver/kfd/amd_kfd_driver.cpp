@@ -902,6 +902,27 @@ hsa_status_t KfdDriver::GetDeviceFd(uint32_t node_id, int *fd) const {
   return HSA_STATUS_SUCCESS;
 }
 
+hsa_status_t KfdDriver::SvmSetAttr(void* base, size_t size,
+                                   const HSA_SVM_ATTRIBUTE* attribs, size_t count) {
+  HSAKMT_STATUS error = HSAKMT_CALL(
+      hsaKmtSVMSetAttr(base, size, count, const_cast<HSA_SVM_ATTRIBUTE*>(attribs)));
+  return error == HSAKMT_STATUS_SUCCESS ? HSA_STATUS_SUCCESS : HSA_STATUS_ERROR;
+}
+
+hsa_status_t KfdDriver::SvmGetAttr(void* base, size_t size,
+                                   HSA_SVM_ATTRIBUTE* attribs, size_t count) {
+  HSAKMT_STATUS error = HSAKMT_CALL(hsaKmtSVMGetAttr(base, size, count, attribs));
+  return error == HSAKMT_STATUS_SUCCESS ? HSA_STATUS_SUCCESS : HSA_STATUS_ERROR;
+}
+
+hsa_status_t KfdDriver::SvmPrefetch(void* base, size_t size, uint32_t dst_node) {
+  HSA_SVM_ATTRIBUTE attrib;
+  attrib.type = HSA_SVM_ATTR_PREFETCH_LOC;
+  attrib.value = dst_node;
+  HSAKMT_STATUS error = HSAKMT_CALL(hsaKmtSVMSetAttr(base, size, 1, &attrib));
+  return error == HSAKMT_STATUS_SUCCESS ? HSA_STATUS_SUCCESS : HSA_STATUS_ERROR;
+}
+
 hsa_status_t KfdDriver::GetClockCounters(uint32_t node_id, HsaClockCounters* clock_counter) const {
   assert(clock_counter);
 

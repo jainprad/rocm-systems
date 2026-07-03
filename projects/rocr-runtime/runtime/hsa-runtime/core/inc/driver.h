@@ -402,6 +402,40 @@ public:
     return HSA_STATUS_ERROR;
   }
 
+  /// @brief Set SVM attributes for an address range.
+  ///
+  /// The @p attribs array follows the libhsakmt @ref HSA_SVM_ATTRIBUTE
+  /// convention (target GPU encoded in each attribute's value as a node id).
+  /// Backends that map to a per-device model (e.g. DRM) split the array and
+  /// dispatch per device internally, so callers never pass a node list.
+  /// @return HSA_STATUS_SUCCESS on success.
+  virtual hsa_status_t SvmSetAttr(void* base, size_t size,
+                                  const HSA_SVM_ATTRIBUTE* attribs, size_t count) {
+    return HSA_STATUS_ERROR_INVALID_AGENT;
+  }
+
+  /// @brief Query SVM attributes for an address range.
+  ///
+  /// Results are written back into @p attribs using the same
+  /// @ref HSA_SVM_ATTRIBUTE convention as the KFD path (value = node id, or
+  /// INVALID_NODEID for sysmem/undefined), so backend differences are hidden
+  /// from callers.
+  /// @return HSA_STATUS_SUCCESS on success.
+  virtual hsa_status_t SvmGetAttr(void* base, size_t size,
+                                  HSA_SVM_ATTRIBUTE* attribs, size_t count) {
+    return HSA_STATUS_ERROR_INVALID_AGENT;
+  }
+
+  /// @brief Prefetch (migrate) an SVM range to @p dst_node.
+  ///
+  /// @p dst_node is a target node id (a GPU, or a CPU/sysmem node). The full
+  /// GPU list required by per-device backends is obtained internally, so the
+  /// interface stays single-target.
+  /// @return HSA_STATUS_SUCCESS on success.
+  virtual hsa_status_t SvmPrefetch(void* base, size_t size, uint32_t dst_node) {
+    return HSA_STATUS_ERROR_INVALID_AGENT;
+  }
+
   /// @brief Gets the device handle for a specific node.
   /// @param node_id Node ID of the agent
   /// @param device_handle Device handle

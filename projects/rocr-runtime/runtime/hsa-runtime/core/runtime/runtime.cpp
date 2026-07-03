@@ -3215,8 +3215,8 @@ hsa_status_t Runtime::SetSvmAttrib(void* ptr, size_t size,
   uint8_t* base = AlignDown((uint8_t*)ptr, 4096);
   uint8_t* end = AlignUp((uint8_t*)ptr + size, 4096);
   size_t len = end - base;
-  HSAKMT_STATUS error = HSAKMT_CALL(hsaKmtSVMSetAttr(base, len, attribs.size(), &attribs[0]));
-  if (error != HSAKMT_STATUS_SUCCESS)
+  hsa_status_t error = AgentDriver().SvmSetAttr(base, len, &attribs[0], attribs.size());
+  if (error != HSA_STATUS_SUCCESS)
     throw AMD::hsa_exception(HSA_STATUS_ERROR, "hsaKmtSVMSetAttr failed.");
 
   return HSA_STATUS_SUCCESS;
@@ -3301,8 +3301,8 @@ hsa_status_t Runtime::GetSvmAttrib(void* ptr, size_t size,
   uint8_t* end = AlignUp((uint8_t*)ptr + size, 4096);
   size_t len = end - base;
   if (attribs.size() != 0) {
-    HSAKMT_STATUS error = HSAKMT_CALL(hsaKmtSVMGetAttr(base, len, attribs.size(), &attribs[0]));
-    if (error != HSAKMT_STATUS_SUCCESS)
+    hsa_status_t error = AgentDriver().SvmGetAttr(base, len, &attribs[0], attribs.size());
+    if (error != HSA_STATUS_SUCCESS)
       throw AMD::hsa_exception(HSA_STATUS_ERROR, "hsaKmtSVMGetAttr failed.");
   }
 
@@ -3488,11 +3488,9 @@ hsa_status_t Runtime::SvmPrefetch(void* ptr, size_t size, hsa_agent_t agent,
       return false;
     }
 
-    HSA_SVM_ATTRIBUTE attrib;
-    attrib.type = HSA_SVM_ATTR_PREFETCH_LOC;
-    attrib.value = op->node_id;
-    HSAKMT_STATUS error = HSAKMT_CALL(hsaKmtSVMSetAttr(op->base, op->size, 1, &attrib));
-    assert(error == HSAKMT_STATUS_SUCCESS && "KFD Prefetch failed.");
+    hsa_status_t error = Runtime::runtime_singleton_->AgentDriver(op->node_id)
+                             .SvmPrefetch(op->base, op->size, op->node_id);
+    assert(error == HSA_STATUS_SUCCESS && "KFD Prefetch failed.");
     (void)error;
 
     removePrefetchRanges(op);
@@ -3561,9 +3559,9 @@ Agent* Runtime::GetSVMPrefetchAgent(void* ptr, size_t size) {
   HSA_SVM_ATTRIBUTE attrib;
   attrib.type = HSA_SVM_ATTR_PREFETCH_LOC;
   for (auto& range : holes) {
-    HSAKMT_STATUS error =
-        HSAKMT_CALL(hsaKmtSVMGetAttr(reinterpret_cast<void*>(range.first), range.second, 1, &attrib));
-    assert(error == HSAKMT_STATUS_SUCCESS && "KFD prefetch query failed.");
+    hsa_status_t error =
+        AgentDriver().SvmGetAttr(reinterpret_cast<void*>(range.first), range.second, &attrib, 1);
+    assert(error == HSA_STATUS_SUCCESS && "KFD prefetch query failed.");
     (void)error;
 
     if (attrib.value == -1) return nullptr;
@@ -3633,9 +3631,9 @@ hsa_status_t Runtime::SvmBatchDiscard(void** ptrs, size_t* sizes, uint32_t count
     attr.value = 0;
 
     Agent* cpu_agent = nullptr;
-    HSAKMT_STATUS status = HSAKMT_CALL(hsaKmtSVMGetAttr(base, len, 1, &attr));
+    hsa_status_t status = AgentDriver().SvmGetAttr(base, len, &attr, 1);
 
-    if (status == HSAKMT_STATUS_SUCCESS &&
+    if (status == HSA_STATUS_SUCCESS &&
         (attr.value != 0xFFFFFFFF && attr.value != INVALID_NODEID)) {
       core::Agent* agent = agents_by_node_[attr.value][0];
 
@@ -3673,12 +3671,8 @@ hsa_status_t Runtime::SvmBatchDiscard(void** ptrs, size_t* sizes, uint32_t count
       uint32_t target_cpu = op->target_cpus[i];
 
       if (target_cpu != UINT32_MAX) {
-        HSA_SVM_ATTRIBUTE attr;
-        attr.type = HSA_SVM_ATTR_PREFETCH_LOC;
-        attr.value = target_cpu;
-
-        HSAKMT_STATUS err = HSAKMT_CALL(hsaKmtSVMSetAttr(base, size, 1, &attr));
-        if (err != HSAKMT_STATUS_SUCCESS) {
+        hsa_status_t err = Runtime::runtime_singleton_->AgentDriver().SvmPrefetch(base, size, target_cpu);
+        if (err != HSA_STATUS_SUCCESS) {
           debug_warning(false && "hsaKmtSVMSetAttr prefetch failed in SvmBatchDiscard");
         }
       }

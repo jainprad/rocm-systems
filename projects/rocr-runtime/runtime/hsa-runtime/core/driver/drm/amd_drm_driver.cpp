@@ -7,6 +7,8 @@
 
 #include <cerrno>
 #include <cstring>
+#include <algorithm>
+#include <vector>
 
 #include "core/inc/amd_drm_driver.h"
 #include "core/inc/amd_aql_queue.h"
@@ -386,6 +388,280 @@ hsa_status_t DrmDriver::AllocQueueGWS(HSA_QUEUEID queue_id, uint32_t num_gws,
 hsa_status_t DrmDriver::DestroyQueue(HSA_QUEUEID queue_id) const {
   if (HSAKMT_CALL(hsaKmtDestroyQueue(queue_id)) != HSAKMT_STATUS_SUCCESS) {
     return HSA_STATUS_ERROR;
+  }
+  return HSA_STATUS_SUCCESS;
+}
+
+namespace {
+
+// Flags that ROCr's SVM path (hsaKmt convention) can set/query and their DRM
+// boolean-attribute counterparts. HSA_SVM_FLAG_GPU_ALWAYS_MAPPED has no DRM
+// equivalent and is intentionally omitted.
+struct SvmFlagMap {
+  uint32_t hsa_flag;
+  uint32_t drm_attr;
+};
+
+constexpr SvmFlagMap kSvmFlagMap[] = {
+    {HSA_SVM_FLAG_HOST_ACCESS, AMDGPU_SVM_ATTR_HOST_ACCESS},
+    {HSA_SVM_FLAG_COHERENT, AMDGPU_SVM_ATTR_COHERENT},
+    {HSA_SVM_FLAG_EXT_COHERENT, AMDGPU_SVM_ATTR_EXT_COHERENT},
+    {HSA_SVM_FLAG_HIVE_LOCAL, AMDGPU_SVM_ATTR_HIVE_LOCAL},
+    {HSA_SVM_FLAG_GPU_RO, AMDGPU_SVM_ATTR_GPU_RO},
+    {HSA_SVM_FLAG_GPU_EXEC, AMDGPU_SVM_ATTR_GPU_EXEC},
+    {HSA_SVM_FLAG_GPU_READ_MOSTLY, AMDGPU_SVM_ATTR_GPU_READ_MOSTLY},
+};
+
+// Union of flags that GetSvmAttrib reconstructs from SET_FLAGS/CLR_FLAGS.
+constexpr uint32_t kKnownSvmFlags =
+    HSA_SVM_FLAG_HOST_ACCESS | HSA_SVM_FLAG_COHERENT | HSA_SVM_FLAG_EXT_COHERENT |
+    HSA_SVM_FLAG_HIVE_LOCAL | HSA_SVM_FLAG_GPU_RO | HSA_SVM_FLAG_GPU_READ_MOSTLY;
+
+bool IsGpuNode(uint32_t node, const std::vector<uint32_t>& gpu_nodes) {
+  return std::find(gpu_nodes.begin(), gpu_nodes.end(), node) != gpu_nodes.end();
+}
+
+// A stable, non-zero, non-UNDEFINED value that identifies a GPU to the kernel's
+// SVM location field. The kernel treats any value other than SYSMEM(0) and
+// UNDEFINED(0xffffffff) as "this GPU/VRAM", so the DRM render minor is used to
+// honor the "write the DRM render id" convention.
+uint32_t DrmRenderIdForNode(uint32_t node_id) {
+  HsaNodeProperties props{};
+  if (HSAKMT_CALL(hsaKmtGetNodeProperties(node_id, &props)) == HSAKMT_STATUS_SUCCESS &&
+      props.DrmRenderMinor > 0)
+    return static_cast<uint32_t>(props.DrmRenderMinor);
+  // Fallback: any stable non-zero, non-UNDEFINED value denotes "this GPU".
+  return node_id != 0 ? node_id : 1u;
+}
+
+}  // namespace
+
+hsa_status_t DrmDriver::SvmSetAttr(void* base, size_t size, const HSA_SVM_ATTRIBUTE* attribs,
+                                   size_t count) {
+  const auto& gpu_nodes = core::Runtime::runtime_singleton_->gpu_ids();
+  if (gpu_nodes.empty()) return HSA_STATUS_ERROR;
+
+  // Aggregate flag bitmasks once; they apply to every device.
+  uint32_t set_flags = 0, clr_flags = 0;
+  for (size_t i = 0; i < count; ++i) {
+    if (attribs[i].type == HSA_SVM_ATTR_SET_FLAGS) set_flags |= attribs[i].value;
+    else if (attribs[i].type == HSA_SVM_ATTR_CLR_FLAGS) clr_flags |= attribs[i].value;
+  }
+
+  // "One svm one gpu": translate the array relative to each GPU's fd and issue
+  // a per-device ioctl so every GPU's independent SVM context is updated.
+  for (uint32_t node : gpu_nodes) {
+    void* handle = nullptr;
+    if (GetDeviceHandle(node, &handle) != HSA_STATUS_SUCCESS || handle == nullptr) continue;
+    amdgpu_device_handle dev = reinterpret_cast<amdgpu_device_handle>(handle);
+    const uint32_t render_id = DrmRenderIdForNode(node);
+
+    std::vector<drm_amdgpu_svm_attribute> da;
+    da.reserve(count + sizeof(kSvmFlagMap) / sizeof(kSvmFlagMap[0]));
+
+    for (size_t i = 0; i < count; ++i) {
+      const uint32_t value = attribs[i].value;
+      switch (attribs[i].type) {
+        case HSA_SVM_ATTR_PREFERRED_LOC:
+        case HSA_SVM_ATTR_PREFETCH_LOC: {
+          const uint32_t drm_type = (attribs[i].type == HSA_SVM_ATTR_PREFERRED_LOC)
+                                        ? AMDGPU_SVM_ATTR_PREFERRED_LOC
+                                        : AMDGPU_SVM_ATTR_PREFETCH_LOC;
+          uint32_t drm_value;
+          if (value == node) {
+            drm_value = render_id;
+          } else if (value == INVALID_NODEID) {
+            drm_value = AMDGPU_SVM_LOCATION_UNDEFINED;
+          } else if (IsGpuNode(value, gpu_nodes)) {
+            // Targets a different GPU; leave this device's context untouched.
+            continue;
+          } else {
+            drm_value = AMDGPU_SVM_LOCATION_SYSMEM;
+          }
+          da.push_back({drm_type, drm_value});
+          break;
+        }
+        case HSA_SVM_ATTR_ACCESS:
+        case HSA_SVM_ATTR_ACCESS_IN_PLACE:
+        case HSA_SVM_ATTR_NO_ACCESS: {
+          // Access is per-gpuid in the KFD model; only apply the entry that
+          // targets this device.
+          if (value != node) continue;
+          uint32_t policy = AMDGPU_SVM_ACCESS_ALLOW_MIGRATE;
+          if (attribs[i].type == HSA_SVM_ATTR_ACCESS_IN_PLACE)
+            policy = AMDGPU_SVM_ACCESS_IN_PLACE;
+          else if (attribs[i].type == HSA_SVM_ATTR_NO_ACCESS)
+            policy = AMDGPU_SVM_ACCESS_INACCESSIBLE;
+          da.push_back({AMDGPU_SVM_ATTR_ACCESS, policy});
+          break;
+        }
+        case HSA_SVM_ATTR_GRANULARITY:
+          da.push_back({AMDGPU_SVM_ATTR_GRANULARITY, value});
+          break;
+        case HSA_SVM_ATTR_SET_FLAGS:
+        case HSA_SVM_ATTR_CLR_FLAGS:
+          // Handled below in aggregate.
+          break;
+        default:
+          break;
+      }
+    }
+
+    for (const auto& fm : kSvmFlagMap) {
+      if (set_flags & fm.hsa_flag)
+        da.push_back({fm.drm_attr, 1});
+      else if (clr_flags & fm.hsa_flag)
+        da.push_back({fm.drm_attr, 0});
+    }
+
+    if (da.empty()) continue;
+
+    if (amdgpu_svm_set_attr(dev, reinterpret_cast<uint64_t>(base), size,
+                            static_cast<uint32_t>(da.size()), da.data()) != 0)
+      return HSA_STATUS_ERROR;
+  }
+
+  return HSA_STATUS_SUCCESS;
+}
+
+hsa_status_t DrmDriver::SvmGetAttr(void* base, size_t size, HSA_SVM_ATTRIBUTE* attribs,
+                                   size_t count) {
+  const auto& gpu_nodes = core::Runtime::runtime_singleton_->gpu_ids();
+  if (gpu_nodes.empty())
+    return HSA_STATUS_ERROR;
+
+  auto device_for = [&](uint32_t node) -> amdgpu_device_handle {
+    void* handle = nullptr;
+    if (GetDeviceHandle(node, &handle) != HSA_STATUS_SUCCESS) return nullptr;
+    return reinterpret_cast<amdgpu_device_handle>(handle);
+  };
+
+  // Reconstruct the current flag bitmask from a representative device so that
+  // SET_FLAGS/CLR_FLAGS slots match what GetSvmAttrib expects to read back.
+  auto query_flags = [&]() -> uint32_t {
+    uint32_t flags = 0;
+    amdgpu_device_handle dev = device_for(gpu_nodes[0]);
+    if (dev == nullptr) return flags;
+    for (const auto& fm : kSvmFlagMap) {
+      if (fm.hsa_flag & ~kKnownSvmFlags) continue;
+      drm_amdgpu_svm_attribute at{fm.drm_attr, 0};
+      if (amdgpu_svm_get_attr(dev, reinterpret_cast<uint64_t>(base), size, 1, &at) == 0 &&
+          at.value)
+        flags |= fm.hsa_flag;
+    }
+    return flags;
+  };
+
+  bool flags_valid = false;
+  uint32_t cur_flags = 0;
+
+  for (size_t i = 0; i < count; ++i) {
+    switch (attribs[i].type) {
+      case HSA_SVM_ATTR_PREFERRED_LOC:
+      case HSA_SVM_ATTR_PREFETCH_LOC: {
+        const uint32_t drm_type = (attribs[i].type == HSA_SVM_ATTR_PREFERRED_LOC)
+                                      ? AMDGPU_SVM_ATTR_PREFERRED_LOC
+                                      : AMDGPU_SVM_ATTR_PREFETCH_LOC;
+        uint32_t result = INVALID_NODEID;
+        bool sysmem_seen = false;
+        for (uint32_t node : gpu_nodes) {
+          amdgpu_device_handle dev = device_for(node);
+          if (dev == nullptr) continue;
+          drm_amdgpu_svm_attribute at{drm_type, 0};
+          if (amdgpu_svm_get_attr(dev, reinterpret_cast<uint64_t>(base), size, 1, &at) != 0)
+            continue;
+          if (at.value == AMDGPU_SVM_LOCATION_UNDEFINED) continue;
+          if (at.value == AMDGPU_SVM_LOCATION_SYSMEM) {
+            sysmem_seen = true;
+            continue;
+          }
+          // Not sysmem and not undefined => the range lives on this GPU. Map
+          // back to the KFD node-id convention regardless of the raw value.
+          result = node;
+          break;
+        }
+        if (result == INVALID_NODEID && sysmem_seen) result = 0;
+        attribs[i].value = result;
+        break;
+      }
+      case HSA_SVM_ATTR_GRANULARITY: {
+        amdgpu_device_handle dev = device_for(gpu_nodes[0]);
+        drm_amdgpu_svm_attribute at{AMDGPU_SVM_ATTR_GRANULARITY, 0};
+        if (dev != nullptr &&
+            amdgpu_svm_get_attr(dev, reinterpret_cast<uint64_t>(base), size, 1, &at) == 0)
+          attribs[i].value = at.value;
+        break;
+      }
+      case HSA_SVM_ATTR_ACCESS:
+      case HSA_SVM_ATTR_ACCESS_IN_PLACE:
+      case HSA_SVM_ATTR_NO_ACCESS: {
+        const uint32_t node = attribs[i].value;
+        amdgpu_device_handle dev = device_for(node);
+        drm_amdgpu_svm_attribute at{AMDGPU_SVM_ATTR_ACCESS, 0};
+        if (dev != nullptr &&
+            amdgpu_svm_get_attr(dev, reinterpret_cast<uint64_t>(base), size, 1, &at) == 0) {
+          switch (at.value) {
+            case AMDGPU_SVM_ACCESS_IN_PLACE:
+              attribs[i].type = HSA_SVM_ATTR_ACCESS_IN_PLACE;
+              break;
+            case AMDGPU_SVM_ACCESS_INACCESSIBLE:
+              attribs[i].type = HSA_SVM_ATTR_NO_ACCESS;
+              break;
+            case AMDGPU_SVM_ACCESS_ALLOW_MIGRATE:
+            default:
+              attribs[i].type = HSA_SVM_ATTR_ACCESS;
+              break;
+          }
+        }
+        break;
+      }
+      case HSA_SVM_ATTR_SET_FLAGS: {
+        if (!flags_valid) { cur_flags = query_flags(); flags_valid = true; }
+        attribs[i].value = cur_flags;
+        break;
+      }
+      case HSA_SVM_ATTR_CLR_FLAGS: {
+        if (!flags_valid) { cur_flags = query_flags(); flags_valid = true; }
+        attribs[i].value = kKnownSvmFlags & ~cur_flags;
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  return HSA_STATUS_SUCCESS;
+}
+
+hsa_status_t DrmDriver::SvmPrefetch(void* base, size_t size, uint32_t dst_node) {
+  const auto& gpu_nodes = core::Runtime::runtime_singleton_->gpu_ids();
+  if (gpu_nodes.empty()) return HSA_STATUS_ERROR;
+
+  if (IsGpuNode(dst_node, gpu_nodes)) {
+    // Migrate to a specific GPU: prefetch on that GPU's fd only.
+    void* handle = nullptr;
+    if (GetDeviceHandle(dst_node, &handle) != HSA_STATUS_SUCCESS || handle == nullptr)
+      return HSA_STATUS_ERROR;
+
+    drm_amdgpu_svm_attribute attr{AMDGPU_SVM_ATTR_PREFETCH_LOC, DrmRenderIdForNode(dst_node)};
+    if (amdgpu_svm_set_attr(reinterpret_cast<amdgpu_device_handle>(handle),
+                            reinterpret_cast<uint64_t>(base), size, 1, &attr) != 0)
+      return HSA_STATUS_ERROR;
+
+    return HSA_STATUS_SUCCESS;
+  }
+
+  // Prefetch to system memory: every GPU's independent SVM context must be
+  // updated, so issue the ioctl on each device's fd.
+  drm_amdgpu_svm_attribute attr{AMDGPU_SVM_ATTR_PREFETCH_LOC, AMDGPU_SVM_LOCATION_SYSMEM};
+
+  for (uint32_t node : gpu_nodes) {
+    void* handle = nullptr;
+    if (GetDeviceHandle(node, &handle) != HSA_STATUS_SUCCESS || handle == nullptr)
+      continue;
+
+    amdgpu_svm_set_attr(reinterpret_cast<amdgpu_device_handle>(handle),
+                        reinterpret_cast<uint64_t>(base), size, 1, &attr);
   }
   return HSA_STATUS_SUCCESS;
 }

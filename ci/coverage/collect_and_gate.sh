@@ -41,6 +41,22 @@ echo "  coverage root: ${COV_ROOT}"
 echo "  fail-under   : ${FAIL_UNDER}%"
 echo "  build dir    : ${BUILD_DIR}"
 
+# ---------------------------------------------------------------------------
+# 0. Guard: coverage data must exist.
+#    .gcno is produced at COMPILE time (--coverage) and .gcda at RUN time
+#    (tests execute). If the instrumented build/tests did not run on this
+#    runner (e.g. a hosted runner with no ROCm toolchain/GPU), there is
+#    nothing to measure. Skip the gate neutrally instead of erroring; the
+#    gate is enforced on a ROCm-capable runner where the build + tests run.
+# ---------------------------------------------------------------------------
+if [[ ! -d "${BUILD_DIR}" ]] || ! find "${BUILD_DIR}" -type f -name '*.gcda' 2>/dev/null | grep -q .; then
+  echo "::warning title=Coverage skipped::No coverage data (*.gcda) under '${BUILD_DIR}'."
+  echo "The instrumented CLR/HIP build+tests did not run on this runner"
+  echo "(requires ROCm toolchain for compile and an AMD GPU to run the tests)."
+  echo "Skipping the diff-coverage gate. Enforce it on a ROCm-capable runner."
+  exit 0
+fi
+
 command -v gcovr     >/dev/null 2>&1 || { echo "ERROR: gcovr not found";     exit 2; }
 command -v diff-cover >/dev/null 2>&1 || { echo "ERROR: diff-cover not found"; exit 2; }
 

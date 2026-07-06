@@ -30,16 +30,22 @@ permissions:
 jobs:
   diff-coverage:
     name: Diff coverage gate
-    # NOTE: building CLR/HIP needs the ROCm toolchain (and GPUs for the full
-    # suite). Point this at a self-hosted ROCm runner in real use, e.g.:
-    #   runs-on: [self-hosted, linux, gpu, rocm]
-    runs-on: ubuntu-latest
+    # Building CLR/HIP with coverage needs the ROCm toolchain (and an AMD GPU to
+    # run the graph tests that produce .gcda). Set repo/org variable
+    # COVERAGE_RUNNER to your self-hosted ROCm runner label(s) to actually
+    # generate coverage, e.g. COVERAGE_RUNNER='["self-hosted","linux","gpu","rocm"]'.
+    # On the default hosted runner the build is skipped and the gate is neutral.
+    runs-on: ${{ vars.COVERAGE_RUNNER && fromJSON(vars.COVERAGE_RUNNER) || 'ubuntu-latest' }}
     env:
       BASE_REF: origin/${{ github.base_ref }}
       COV_ROOT: projects/clr
       FAIL_UNDER: '80'
       BUILD_DIR: build
       REPORT_DIR: coverage-reports
+      # Optional: wire the real ROCm coverage build without editing this file.
+      CONFIGURE_CMD: ${{ vars.COVERAGE_CONFIGURE_CMD }}
+      BUILD_CMD: ${{ vars.COVERAGE_BUILD_CMD }}
+      TEST_CMD: ${{ vars.COVERAGE_TEST_CMD }}
     steps:
       - name: Checkout (full history for diffing)
         uses: actions/checkout@v4
@@ -51,9 +57,15 @@ jobs:
 
       - name: Install coverage tooling
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcovr lcov
-          python3 -m pip install --upgrade "diff-cover>=9"
+          set -x
+          if command -v apt-get >/dev/null 2>&1; then
+            (sudo apt-get update && sudo apt-get install -y gcovr lcov) \
+              || (apt-get update && apt-get install -y gcovr lcov) || true
+          fi
+          command -v gcovr >/dev/null 2>&1 || python3 -m pip install --user gcovr
+          python3 -m pip install --user --upgrade "diff-cover>=9" || \
+            python3 -m pip install --upgrade "diff-cover>=9"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Build with coverage + run tests
         run: bash ci/coverage/build_and_test.sh

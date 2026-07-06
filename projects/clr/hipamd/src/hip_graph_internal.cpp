@@ -2338,23 +2338,32 @@ hipError_t GraphExec::EnqueueSegment(const Segment& segment, hip::Stream* stream
 
   size_t batchIndex = 0;
 
-  // A downstream segment can begin with an uncaptured host node whose callback
-  // reads host memory produced by this segment's captured AQL batch.  When this
-  // segment reaches its tail batch, publish those GPU writes with system scope
-  // before the host callback is allowed to run.
-  const bool host_first_consumer = [&]() -> bool {
-    for (int edge_id : segment.segment_ids_edges) {
-      if (edge_id < 0 || edge_id >= static_cast<int>(segments_.size())) {
-        continue;
-      }
-      const auto& consumer = segments_[edge_id];
-      if (consumer.first_node != nullptr &&
-          consumer.first_node->GetType() == hipGraphNodeTypeHost) {
-        return true;
-      }
+  auto memcpyUsesSdmaEngine = [](GraphNode* graph_node) -> bool {
+    if (graph_node == nullptr || graph_node->GetType() != hipGraphNodeTypeMemcpy) {
+      return false;
     }
-    return false;
-  }();
+    auto* memcpyNode = dynamic_cast<GraphMemcpyNode*>(graph_node);
+    // Memcpy node types that do not derive from GraphMemcpyNode
+    // (for example GraphDrvMemcpyNode) fall back to the conservative
+    // "assume SDMA" behavior.
+    return (memcpyNode == nullptr) || !memcpyNode->WillBypassSdmaEngine();
+  };
+
+  auto memcpyNeedsSystemScopeAfterKernel = [](GraphNode* graph_node) -> bool {
+    if (graph_node == nullptr || graph_node->GetType() != hipGraphNodeTypeMemcpy) {
+      return false;
+    }
+    auto* memcpyNode = dynamic_cast<GraphMemcpyNode*>(graph_node);
+    return (memcpyNode == nullptr) || memcpyNode->RequiresSystemScopeAfterKernel();
+  };
+
+  auto memcpyWritesHostWithBlitKernel = [](GraphNode* graph_node) -> bool {
+    if (graph_node == nullptr || graph_node->GetType() != hipGraphNodeTypeMemcpy) {
+      return false;
+    }
+    auto* memcpyNode = dynamic_cast<GraphMemcpyNode*>(graph_node);
+    return (memcpyNode != nullptr) && memcpyNode->WritesHostMemoryWithBlitKernel();
+  };
 
   // Lambda to dispatch the current batch at batchIndex.
   // attach_signal=true asks the dispatcher to give the last packet a real
@@ -2482,35 +2491,59 @@ hipError_t GraphExec::EnqueueSegment(const Segment& segment, hip::Stream* stream
             segment.nodes[j]->hw_queue_id_ = stream->getQueueID();
           }
         }
-        // Skip all consecutive captured nodes that belong to this batch
-        i += packetBatch.nodeRanges.size() - 1;
-        // Check whether the captured batch hands data to an uncaptured consumer.
-        // SDMA memcpy consumers need an attached signal for engine ordering.
-        // Host-node consumers need system-scope release on the producer batch so
-        // their CPU callback can observe host-memory writes made by captured
-        // kernels or D2H blits.
+        const size_t batch_start = i;
+        const size_t batch_node_count = packetBatch.nodeRanges.size();
+        bool batch_has_enabled_kernel = false;
+        bool batch_writes_cpu_with_blit = false;
+        for (size_t range_idx = 0; range_idx < batch_node_count; ++range_idx) {
+          const size_t node_idx = batch_start + range_idx;
+          if (node_idx >= segment.nodes.size()) {
+            break;
+          }
+          if (!packetBatch.nodeRanges[range_idx].enabled) {
+            continue;
+          }
+          GraphNode* batch_node = segment.nodes[node_idx];
+          if (batch_node->GetType() == hipGraphNodeTypeKernel) {
+            batch_has_enabled_kernel = true;
+          }
+          if (memcpyWritesHostWithBlitKernel(batch_node)) {
+            batch_writes_cpu_with_blit = true;
+          }
+        }
+
+        // Skip all consecutive captured nodes that belong to this batch.
+        i += batch_node_count - 1;
+
+        // sdma_follows: whether the next uncaptured node uses the SDMA engine.
+        // Used only for signal attachment — the flat batch gets a completion
+        // signal so the copy engine can wait for it (cross-engine ordering).
+        //
+        // needs_sdma_scope: whether SDMA reads GPU mem written by this batch's
+        // kernels. Distinct from sdma_follows: H2D SDMA reads CPU mem (no L2
+        // flush needed); only D2H/D2D/P2P SDMA reading GPU mem needs scope.
         bool sdma_follows = false;
-        bool host_follows = false;
+        bool needs_sdma_scope = false;
         size_t next = i + 1;
         if (next < segment.nodes.size() &&
             next < segBatch->node_capture_status.size() &&
             !segBatch->node_capture_status[next]) {
-          const auto next_type = segment.nodes[next]->GetType();
-          host_follows = (next_type == hipGraphNodeTypeHost);
-          if (next_type == hipGraphNodeTypeMemcpy) {
-            auto* memcpyNode = dynamic_cast<GraphMemcpyNode*>(segment.nodes[next]);
-            // Memcpy node types that don't derive from GraphMemcpyNode
-            // (e.g. GraphDrvMemcpyNode) fall back to the conservative
-            // "assume SDMA" behavior.
-            sdma_follows = (memcpyNode == nullptr) || !memcpyNode->WillBypassSdmaEngine();
-          }
+          GraphNode* next_node = segment.nodes[next];
+          sdma_follows = memcpyUsesSdmaEngine(next_node);
+          needs_sdma_scope = batch_has_enabled_kernel &&
+                             memcpyNeedsSystemScopeAfterKernel(next_node);
         }
-        // Cover both host-node layouts: the host node can immediately follow in
-        // the same segment, or it can be the first node of a downstream segment
-        // after this segment's tail batch.
-        bool host_consumer_needs_scope = host_follows ||
-            (host_first_consumer && next >= segment.nodes.size());
-        if ((sdma_follows || host_consumer_needs_scope) && !packetBatch.dispatchPackets.empty()) {
+
+        // Producer-side system scope for CPX cache coherency:
+        //  - SDMA reads GPU mem: GPU L2 must be flushed before the copy engine
+        //    reads, as queue ordering alone is not sufficient on CPX.
+        //  - Blit D2H in this flat batch writes CPU mem via GPU cache: GPU L2
+        //    must be flushed so the CPU consumer (host node or CPU code) sees
+        //    the update. Host nodes cannot use consumer-side addSystemScope
+        //    because GraphHostNode::EnqueueCommands does not dispatch AQL
+        //    packets that would consume addSystemScope_.
+        if ((needs_sdma_scope || batch_writes_cpu_with_blit) &&
+            !packetBatch.dispatchPackets.empty()) {
           stream->vdev()->addSystemScope();
         }
         status = dispatchCurrentBatch(sdma_follows);
@@ -2527,6 +2560,15 @@ hipError_t GraphExec::EnqueueSegment(const Segment& segment, hip::Stream* stream
       node->SetStream(stream);
       status = node->CreateCommand(node->GetQueue());
       if (status != hipSuccess) return status;
+      // Uncaptured blit D2H writes CPU mem via GPU cache. The blit is the
+      // producer of CPU-visible data, so system scope must be on the blit's
+      // own AQL packet. addSystemScope here is consumed by
+      // dispatchGenericAqlPacket inside blitMgr().copyBuffer/readBuffer(),
+      // giving the blit AQL packet a SYSTEM release fence so its GPU cache
+      // writes are flushed before the completion signal fires.
+      if (memcpyWritesHostWithBlitKernel(node)) {
+        stream->vdev()->addSystemScope();
+      }
       node->EnqueueCommands(stream);
     }
   }

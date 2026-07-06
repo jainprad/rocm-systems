@@ -2055,13 +2055,54 @@ class GraphMemcpyNode : public GraphNode {
   }
 
   // Returns true when this memcpy will NOT use the SDMA engine, so no
-  // cross-engine sync (system-scope flush + attached completion signal)
-  // is needed when this node follows a captured flat batch.
-  //
-  // Default false (conservatively assumes SDMA) preserves existing behavior
-  // for generic 3D memcpys; GraphMemcpyNode1D overrides with a precise check
-  // based on MemcpyType and copy size.
+  // cross-engine ordering signal is needed when this node follows a captured
+  // flat batch.  Generic 3D memcpys conservatively assume SDMA;
+  // GraphMemcpyNode1D overrides with a precise check based on MemcpyType and
+  // copy size.
   virtual bool WillBypassSdmaEngine() const { return false; }
+
+  // Returns true when this memcpy writes host memory through the blit-kernel
+  // path.  The dispatcher adds a system-scope fence before this node so GPU
+  // caches are flushed and the CPU consumer can observe the update.
+  virtual bool WritesHostMemoryWithBlitKernel() const { return false; }
+
+  // Returns true when this memcpy reads GPU memory via the SDMA engine and
+  // therefore needs a system-scope fence before dispatch on CPX.  Queue
+  // ordering alone does not flush GPU L2 before the SDMA engine reads, so
+  // the dispatcher calls addSystemScope() at this consumer node's dispatch
+  // point when the preceding batch contained GPU kernels.
+  virtual bool RequiresSystemScopeAfterKernel() const {
+    const HIP_MEMCPY3D pCopy = hip::getDrvMemcpy3DDesc(copyParams_);
+    size_t sOffset = 0;
+    size_t dOffset = 0;
+    amd::Memory* srcMemory = nullptr;
+    amd::Memory* dstMemory = nullptr;
+
+    if (pCopy.srcMemoryType == hipMemoryTypeDevice || pCopy.srcMemoryType == hipMemoryTypeUnified) {
+      srcMemory = getMemoryObjectForCurrentDevice(pCopy.srcDevice, sOffset);
+    }
+    if (pCopy.dstMemoryType == hipMemoryTypeDevice || pCopy.dstMemoryType == hipMemoryTypeUnified) {
+      dstMemory = getMemoryObjectForCurrentDevice(pCopy.dstDevice, dOffset);
+    }
+    if (srcMemory == nullptr && pCopy.srcMemoryType == hipMemoryTypeHost) {
+      srcMemory = getMemoryObjectForCurrentDevice(pCopy.srcHost, sOffset);
+    }
+    if (dstMemory == nullptr && pCopy.dstMemoryType == hipMemoryTypeHost) {
+      dstMemory = getMemoryObjectForCurrentDevice(pCopy.dstHost, dOffset);
+    }
+
+    if (srcMemory != nullptr && dstMemory != nullptr) {
+      hip::MemcpyType type = ihipGetMemcpyType(srcMemory, dstMemory, copyParams_.kind);
+      return type == hipCopyBufferSDMA || type == hipCopyBufferP2P;
+    }
+    if (srcMemory != nullptr && dstMemory == nullptr) {
+      const size_t height = (copyParams_.extent.height == 0) ? 1 : copyParams_.extent.height;
+      const size_t depth = (copyParams_.extent.depth == 0) ? 1 : copyParams_.extent.depth;
+      const size_t sizeBytes = copyParams_.extent.width * height * depth;
+      return sizeBytes > GPU_FORCE_BLIT_COPY_SIZE * Ki;
+    }
+    return false;
+  }
 };
 
 class GraphMemcpyNode1D : public GraphMemcpyNode {
@@ -2360,7 +2401,7 @@ class GraphMemcpyNode1D : public GraphMemcpyNode {
     } else if (srcMemory != nullptr) {
       type = ihipGetMemcpyType(srcMemory, dst_);  // D2H
     } else {
-      // Pure H2H runs on the CPU — no GPU engine involved, so no SDMA sync needed.
+      // Pure H2H runs on the CPU -- no GPU engine involved, so no SDMA sync needed.
       return true;
     }
 
@@ -2378,6 +2419,50 @@ class GraphMemcpyNode1D : public GraphMemcpyNode {
       case hipCopyBufferSDMA:
       case hipCopyBufferP2P:
       case hipHostToHost:
+      default:
+        return false;
+    }
+  }
+
+  bool WritesHostMemoryWithBlitKernel() const override {
+    size_t sOffset = 0, dOffset = 0;
+    amd::Memory* srcMemory = getMemoryObjectForCurrentDevice(src_, sOffset);
+    amd::Memory* dstMemory = getMemoryObjectForCurrentDevice(dst_, dOffset);
+
+    hip::MemcpyType type = hipHostToHost;
+    if (srcMemory != nullptr && dstMemory != nullptr) {
+      type = ihipGetMemcpyType(srcMemory, dstMemory, kind_);
+    } else if (srcMemory != nullptr) {
+      type = ihipGetMemcpyType(srcMemory, dst_);  // D2H
+    }
+
+    return kind_ == hipMemcpyDeviceToHost &&
+           (type == hipReadBuffer || type == hipCopyBuffer) && WillBypassSdmaEngine();
+  }
+
+  bool RequiresSystemScopeAfterKernel() const override {
+    size_t sOffset = 0, dOffset = 0;
+    amd::Memory* srcMemory = getMemoryObjectForCurrentDevice(src_, sOffset);
+    amd::Memory* dstMemory = getMemoryObjectForCurrentDevice(dst_, dOffset);
+
+    hip::MemcpyType type = hipHostToHost;
+    if (srcMemory != nullptr && dstMemory != nullptr) {
+      type = ihipGetMemcpyType(srcMemory, dstMemory, kind_);
+    } else if (dstMemory != nullptr) {
+      type = ihipGetMemcpyType(src_, dstMemory);  // H2D
+    } else if (srcMemory != nullptr) {
+      type = ihipGetMemcpyType(srcMemory, dst_);  // D2H
+    }
+
+    switch (type) {
+      case hipReadBuffer:
+        return !WillBypassSdmaEngine();
+      case hipCopyBufferSDMA:
+      case hipCopyBufferP2P:
+        return true;
+      case hipHostToHost:
+      case hipWriteBuffer:
+      case hipCopyBuffer:
       default:
         return false;
     }

@@ -97,10 +97,29 @@ set +e
 diff-cover "${REPORT_DIR}/coverage.xml" \
   --compare-branch="${BASE_REF}" \
   --fail-under="${FAIL_UNDER}" \
-  --html-report "${REPORT_DIR}/diff-coverage.html" \
-  --markdown-report "${REPORT_DIR}/diff-coverage.md"
+  --format "html:${REPORT_DIR}/diff-coverage.html,markdown:${REPORT_DIR}/diff-coverage.md"
 gate_rc=$?
 set -e
+
+# ---------------------------------------------------------------------------
+# 4. Report where to view the HTML reports.
+#    - coverage.html      : full annotated source coverage (gcovr)
+#    - diff-coverage.html : the PR patch-coverage report (diff-cover)
+#    In CI these are uploaded as the "coverage-reports" artifact; download and
+#    open the HTML files in a browser.
+# ---------------------------------------------------------------------------
+report_abs="$(cd "${REPORT_DIR}" && pwd)"
+echo "== Coverage HTML reports =="
+echo "  full coverage : ${report_abs}/coverage.html"
+echo "  patch coverage: ${report_abs}/diff-coverage.html"
+if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+  {
+    echo "### Coverage reports"
+    echo "Download the **coverage-reports** artifact from this run and open:"
+    echo "- \`coverage.html\` — full annotated source coverage"
+    echo "- \`diff-coverage.html\` — PR patch (diff) coverage"
+  } >> "${GITHUB_STEP_SUMMARY}"
+fi
 
 if [[ ${gate_rc} -ne 0 ]]; then
   echo "::error::PR diff coverage is below ${FAIL_UNDER}%. Add tests that exercise the changed lines."

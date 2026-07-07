@@ -1,0 +1,93 @@
+# Phase 1 PR coverage gate.
+#
+# Measures how much of the lines a PR CHANGES are exercised by the test suite
+# (diff / patch coverage) and fails the check when that percentage is below the
+# threshold. Make this job a required status check in branch protection to
+# block merges of under-tested changes.
+#
+# Phase 1 = full test suite + diff-cover gate (simple + always sound).
+# Phase 2 (later) = layer Change-Based Testing (test selection) on top for speed
+# without changing what is gated.
+name: PR Diff Coverage
+
+on:
+  pull_request:
+    branches: [develop]
+    paths:
+      - 'projects/clr/**'
+      - 'ci/coverage/**'
+      - '.github/workflows/pr-diff-coverage.yml'
+
+# Coverage numbers are per-PR; cancel superseded runs.
+concurrency:
+  group: pr-diff-coverage-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  diff-coverage:
+    name: Diff coverage gate
+    # Building CLR/HIP with coverage needs the ROCm toolchain (and an AMD GPU to
+    # run the graph tests that produce .gcda). Set repo/org variable
+    # COVERAGE_RUNNER to your self-hosted ROCm runner label(s) to actually
+    # generate coverage, e.g. COVERAGE_RUNNER='["self-hosted","linux","gpu","rocm"]'.
+    # On the default hosted runner the build is skipped and the gate is neutral.
+    runs-on: ${{ vars.COVERAGE_RUNNER && fromJSON(vars.COVERAGE_RUNNER) || 'ubuntu-latest' }}
+    env:
+      BASE_REF: origin/${{ github.base_ref }}
+      COV_ROOT: projects/clr
+      FAIL_UNDER: '80'
+      BUILD_DIR: build
+      REPORT_DIR: coverage-reports
+      # Optional: wire the real ROCm coverage build without editing this file.
+      CONFIGURE_CMD: ${{ vars.COVERAGE_CONFIGURE_CMD }}
+      BUILD_CMD: ${{ vars.COVERAGE_BUILD_CMD }}
+      TEST_CMD: ${{ vars.COVERAGE_TEST_CMD }}
+    steps:
+      - name: Checkout (full history for diffing)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure base ref is available
+        run: git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+
+      - name: Install coverage tooling
+        run: |
+          set -x
+          if command -v apt-get >/dev/null 2>&1; then
+            (sudo apt-get update && sudo apt-get install -y gcovr lcov) \
+              || (apt-get update && apt-get install -y gcovr lcov) || true
+          fi
+          command -v gcovr >/dev/null 2>&1 || python3 -m pip install --user gcovr
+          python3 -m pip install --user --upgrade "diff-cover>=9" || \
+            python3 -m pip install --upgrade "diff-cover>=9"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build with coverage + run tests
+        run: bash ci/coverage/build_and_test.sh
+
+      - name: Collect coverage + enforce diff-coverage gate
+        run: bash ci/coverage/collect_and_gate.sh
+
+      - name: Publish diff-coverage summary
+        if: always()
+        run: |
+          if [ -f "${REPORT_DIR}/diff-coverage.md" ]; then
+            {
+              echo "## PR Diff Coverage"
+              echo
+              cat "${REPORT_DIR}/diff-coverage.md"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-reports
+          path: ${{ env.REPORT_DIR }}/
+          if-no-files-found: ignore
